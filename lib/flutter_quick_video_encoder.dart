@@ -58,6 +58,18 @@ class FlutterQuickVideoEncoder {
       required int audioBitrate,
       required int sampleRate,
       required String filepath}) async {
+    // H.264 encodes in 16x16 macroblocks and neither AVAssetWriter nor
+    // MediaCodec accepts odd dimensions. Android does not reject them, it
+    // reads past the end of the plane while converting to YUV and produces a
+    // corrupt file or a native crash, several hundred frames in, with nothing
+    // pointing back at the size. Upstream issue #8, open since 2024-07-22.
+    // Failing here costs one line and names the actual problem.
+    if (width % 2 != 0 || height % 2 != 0) {
+      throw ArgumentError(
+          'Video dimensions must both be even, got ${width}x$height. '
+          'H.264 encodes in 16x16 macroblocks; odd sizes corrupt the output '
+          'on Android rather than failing cleanly.');
+    }
     _createIntermediateDirectories(filepath);
     FlutterQuickVideoEncoder.width = width;
     FlutterQuickVideoEncoder.height = height;

@@ -153,7 +153,19 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 // Initialize video input
                 self.mVideoInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeVideo
                                                                 outputSettings:videoSettings];
-                self.mVideoInput.expectsMediaDataInRealTime = YES;
+                // NO, not YES. YES tells AVFoundation the samples are arriving
+                // from a live source in real time, so it must not make the
+                // caller wait — it drops frames rather than block. That is
+                // right for a camera and wrong for an offline encode, where
+                // every frame is rendered ahead of time and pushed as fast as
+                // the writer will take it. With YES the appends outrun the
+                // writer and it fails with "bad status" partway through.
+                //
+                // Only reproduces on a real device: the simulator's encoder is
+                // fast enough to keep up. Upstream issue #13, which the
+                // maintainer closed with "this package is actually no longer
+                // maintained" — which is why this is a fork.
+                self.mVideoInput.expectsMediaDataInRealTime = NO;
 
                 // Add video input to asset writer
                 if (![self.mAssetWriter canAddInput:self.mVideoInput]) {
@@ -180,7 +192,9 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 // Initialize audio input
                 self.mAudioInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio
                                                                 outputSettings:audioSettings];
-                self.mAudioInput.expectsMediaDataInRealTime = YES;
+                // Same reasoning as the video input above: this writer is fed
+                // from a file, not from a microphone.
+                self.mAudioInput.expectsMediaDataInRealTime = NO;
 
                 // Add audio input to asset writer
                 if (![self.mAssetWriter canAddInput:self.mAudioInput]) {
