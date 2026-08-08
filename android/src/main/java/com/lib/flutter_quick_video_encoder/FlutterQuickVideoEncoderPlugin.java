@@ -4,12 +4,15 @@ import android.media.Image;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
+import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.media.MediaMuxer;
 import android.util.Log;
 
 import java.nio.ByteBuffer;
+import java.io.IOException;
 import java.io.PrintWriter;
+import java.io.RandomAccessFile;
 import java.io.StringWriter;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -266,6 +269,17 @@ public class FlutterQuickVideoEncoderPlugin implements
                     result.success(null);
                     break;
                 }
+                case "mux":
+                {
+                    String videoPath = call.argument("videoPath");
+                    String audioPath = call.argument("audioPath");
+                    String outputPath = call.argument("outputPath");
+                    Integer audioBitrate = call.argument("audioBitrate");
+                    muxFile(videoPath, audioPath, outputPath,
+                            audioBitrate == null ? 192000 : audioBitrate);
+                    result.success(null);
+                    break;
+                }
                 default:
                     result.notImplemented();
                     break;
@@ -277,6 +291,239 @@ public class FlutterQuickVideoEncoderPlugin implements
             String stackTrace = sw.toString();
             result.error("androidException", e.toString(), stackTrace);
             return;
+        }
+    }
+
+    /**
+     * Joins a finished video file and a WAV into one MP4.
+     *
+     * The video is passed through — MediaExtractor hands back the compressed
+     * H.264 samples and MediaMuxer writes them straight out, so a long film
+     * costs a container rewrite rather than a re-encode. Only the audio is
+     * encoded, from linear PCM to AAC.
+     *
+     * This exists because audio cannot be written alongside video through
+     * appendAudioFrame: on Apple two writer inputs deadlock whenever samples
+     * are pushed from outside, measured at 37 video frames alternating and 95
+     * audio frames audio-first. The mux is the shape that works, and it is
+     * also the better one — re-scoring a finished film costs a join rather
+     * than another render.
+     *
+     * NOT YET RUN ON A DEVICE. The Apple side of this is verified: 390 frames
+     * in, 390 out, video stream MD5 identical, 311 ms. This is the same design
+     * expressed in the platform's own API and nothing more.
+     */
+    private void muxFile(String videoPath, String audioPath, String outputPath, int audioBitrate)
+            throws Exception {
+        MediaExtractor videoExtractor = new MediaExtractor();
+        MediaMuxer muxer = null;
+        MediaCodec encoder = null;
+        try {
+            videoExtractor.setDataSource(videoPath);
+            int videoTrack = -1;
+            MediaFormat videoFormat = null;
+            for (int i = 0; i < videoExtractor.getTrackCount(); i++) {
+                MediaFormat format = videoExtractor.getTrackFormat(i);
+                String mime = format.getString(MediaFormat.KEY_MIME);
+                if (mime != null && mime.startsWith("video/")) {
+                    videoTrack = i;
+                    videoFormat = format;
+                    break;
+                }
+            }
+            if (videoTrack < 0) {
+                throw new IllegalArgumentException("no video track in " + videoPath);
+            }
+            videoExtractor.selectTrack(videoTrack);
+
+            WavReader wav = new WavReader(audioPath);
+
+            muxer = new MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            int outVideoTrack = muxer.addTrack(videoFormat);
+
+            MediaFormat audioFormat = MediaFormat.createAudioFormat(
+                    MediaFormat.MIMETYPE_AUDIO_AAC, wav.sampleRate, wav.channels);
+            audioFormat.setInteger(MediaFormat.KEY_AAC_PROFILE,
+                    MediaCodecInfo.CodecProfileLevel.AACObjectLC);
+            audioFormat.setInteger(MediaFormat.KEY_BIT_RATE, audioBitrate);
+            encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
+            encoder.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            encoder.start();
+
+            // The muxer needs the encoder's *output* format, which only exists
+            // once the encoder has produced its first buffer — so the audio
+            // track is added mid-flight and start() waits until then.
+            int outAudioTrack = -1;
+            boolean started = false;
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            boolean inputDone = false;
+            boolean outputDone = false;
+
+            while (!outputDone) {
+                if (!inputDone) {
+                    int index = encoder.dequeueInputBuffer(10000);
+                    if (index >= 0) {
+                        ByteBuffer buffer = encoder.getInputBuffer(index);
+                        buffer.clear();
+                        // Taken before the read, so it timestamps the start of
+                        // this buffer rather than the end of it.
+                        long pts = wav.presentationTimeUs();
+                        int read = wav.read(buffer);
+                        if (read <= 0) {
+                            encoder.queueInputBuffer(index, 0, 0, pts,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                            inputDone = true;
+                        } else {
+                            encoder.queueInputBuffer(index, 0, read, pts, 0);
+                        }
+                    }
+                }
+
+                int index = encoder.dequeueOutputBuffer(info, 10000);
+                if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    outAudioTrack = muxer.addTrack(encoder.getOutputFormat());
+                    muxer.start();
+                    started = true;
+                } else if (index >= 0) {
+                    ByteBuffer out = encoder.getOutputBuffer(index);
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                        info.size = 0;
+                    }
+                    if (info.size > 0 && started) {
+                        out.position(info.offset);
+                        out.limit(info.offset + info.size);
+                        muxer.writeSampleData(outAudioTrack, out, info);
+                    }
+                    encoder.releaseOutputBuffer(index, false);
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        outputDone = true;
+                    }
+                }
+            }
+
+            // Video last, because the muxer cannot accept anything until
+            // start(), and start() cannot happen until the encoder has
+            // declared its output format above.
+            ByteBuffer sample = ByteBuffer.allocate(1024 * 1024);
+            MediaCodec.BufferInfo videoInfo = new MediaCodec.BufferInfo();
+            while (true) {
+                int size = videoExtractor.readSampleData(sample, 0);
+                if (size < 0) {
+                    break;
+                }
+                videoInfo.offset = 0;
+                videoInfo.size = size;
+                videoInfo.presentationTimeUs = videoExtractor.getSampleTime();
+                videoInfo.flags = (videoExtractor.getSampleFlags()
+                        & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
+                        ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+                muxer.writeSampleData(outVideoTrack, sample, videoInfo);
+                videoExtractor.advance();
+            }
+
+            muxer.stop();
+        } finally {
+            videoExtractor.release();
+            if (encoder != null) {
+                try { encoder.stop(); } catch (Exception ignored) {}
+                encoder.release();
+            }
+            if (muxer != null) {
+                muxer.release();
+            }
+        }
+    }
+
+    /**
+     * Streams the samples out of a 16-bit PCM WAV.
+     *
+     * Walks the chunk list rather than assuming a 44-byte header: plenty of
+     * writers put a LIST or fact chunk before the data, and skipping to a
+     * fixed offset would feed metadata to the encoder as if it were audio.
+     */
+    private static class WavReader {
+        final int sampleRate;
+        final int channels;
+        private final RandomAccessFile file;
+        private final long dataStart;
+        private final long dataLength;
+        private long position;
+
+        WavReader(String path) throws IOException {
+            file = new RandomAccessFile(path, "r");
+            byte[] header = new byte[12];
+            file.readFully(header);
+            if (header[0] != 'R' || header[1] != 'I' || header[2] != 'F' || header[3] != 'F') {
+                throw new IOException("not a RIFF file: " + path);
+            }
+
+            int rate = 44100;
+            int chans = 2;
+            long start = -1;
+            long length = 0;
+            while (file.getFilePointer() + 8 <= file.length()) {
+                byte[] id = new byte[4];
+                file.readFully(id);
+                long size = readUint32(file);
+                String name = new String(id, "US-ASCII");
+                if ("fmt ".equals(name)) {
+                    readUint16(file);            // audio format
+                    chans = readUint16(file);
+                    rate = (int) readUint32(file);
+                    readUint32(file);            // byte rate
+                    readUint16(file);            // block align
+                    int bits = readUint16(file);
+                    if (bits != 16) {
+                        throw new IOException("expected 16-bit PCM, got " + bits);
+                    }
+                    file.seek(file.getFilePointer() + size - 16);
+                } else if ("data".equals(name)) {
+                    start = file.getFilePointer();
+                    length = size;
+                    break;
+                } else {
+                    file.seek(file.getFilePointer() + size + (size % 2));
+                }
+            }
+            if (start < 0) {
+                throw new IOException("no data chunk in " + path);
+            }
+            sampleRate = rate;
+            channels = chans;
+            dataStart = start;
+            dataLength = length;
+            file.seek(dataStart);
+        }
+
+        /** Microseconds of audio handed out so far. */
+        long presentationTimeUs() {
+            return position * 1000000L / (sampleRate * channels * 2L);
+        }
+
+        int read(ByteBuffer into) throws IOException {
+            long left = dataLength - position;
+            if (left <= 0) {
+                return 0;
+            }
+            int want = (int) Math.min(into.remaining(), left);
+            byte[] chunk = new byte[want];
+            file.readFully(chunk);
+            into.put(chunk);
+            position += want;
+            return want;
+        }
+
+        private static long readUint32(RandomAccessFile from) throws IOException {
+            byte[] b = new byte[4];
+            from.readFully(b);
+            return (b[0] & 0xFFL) | ((b[1] & 0xFFL) << 8)
+                    | ((b[2] & 0xFFL) << 16) | ((b[3] & 0xFFL) << 24);
+        }
+
+        private static int readUint16(RandomAccessFile from) throws IOException {
+            byte[] b = new byte[2];
+            from.readFully(b);
+            return (b[0] & 0xFF) | ((b[1] & 0xFF) << 8);
         }
     }
 

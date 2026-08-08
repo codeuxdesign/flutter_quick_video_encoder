@@ -108,6 +108,32 @@ class FlutterQuickVideoEncoder {
     });
   }
 
+  /// join a finished video file and a wav into one mp4 at [outputPath]
+  ///
+  /// The video is passed through — its compressed samples are copied, not
+  /// re-encoded — so this costs a container rewrite rather than another
+  /// export. Only the audio is encoded, from linear PCM to AAC.
+  ///
+  /// This exists because audio *cannot* be written alongside video through
+  /// [appendAudioFrame]. Two AVAssetWriterInputs only free each other as both
+  /// progress, and anything pushing samples from outside deadlocks the moment
+  /// one goes not-ready: measured, alternating stalls after 37 video frames
+  /// and audio-first stalls after 95 audio frames. Inside the plugin the
+  /// writer drives both inputs itself and the problem does not arise.
+  static Future<void> mux(
+      {required String videoPath,
+      required String audioPath,
+      required String outputPath,
+      int audioBitrate = 192000}) async {
+    _createIntermediateDirectories(outputPath);
+    return await _invokeMethod('mux', {
+      'videoPath': videoPath,
+      'audioPath': audioPath,
+      'outputPath': outputPath,
+      'audioBitrate': audioBitrate,
+    });
+  }
+
   /// finish writing the video file
   static Future<void> finish() async {
     try {

@@ -4,7 +4,15 @@ version '1.0'
 apply plugin: 'com.android.library'
 
 android {
-    compileSdkVersion 33
+    // 34, not 33. Upstream's 33 makes this library unbuildable against a
+    // current Flutter: androidx.fragment 1.7.1 and androidx.window 1.2.0 both
+    // declare a minimum compileSdk of 34, so `checkDebugAarMetadata` fails
+    // with fifteen errors before a single line of Java is compiled.
+    //
+    // compileSdk only chooses which APIs are visible at build time. minSdk
+    // still says which devices can install this, and targetSdk still says
+    // which runtime behaviors are opted into — neither moves here.
+    compileSdkVersion 34
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8

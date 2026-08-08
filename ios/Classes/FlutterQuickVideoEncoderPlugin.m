@@ -419,6 +419,15 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 
             result(@(true));
         }
+        else if ([@"mux" isEqualToString:call.method])
+        {
+            NSDictionary *args = (NSDictionary *)call.arguments;
+            [self muxVideo:args[@"videoPath"]
+                 withAudio:args[@"audioPath"]
+                        to:args[@"outputPath"]
+              audioBitrate:[args[@"audioBitrate"] intValue]
+                    result:result];
+        }
         else
         {
             result([FlutterError errorWithCode:@"functionNotImplemented" message:call.method details:nil]);
@@ -430,6 +439,213 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         NSDictionary *details = @{@"stackTrace": stackTrace};
         result([FlutterError errorWithCode:@"iosException" message:[e reason] details:details]);
     }
+}
+
+/// Joins a finished video file and a WAV into one `.mp4`.
+///
+/// The video is **passed through** — its compressed samples are copied across
+/// with `outputSettings:nil`, so a two-and-a-half minute 1080p film costs a
+/// container rewrite rather than a re-encode. Only the audio is encoded, from
+/// linear PCM to AAC.
+///
+/// Both inputs are driven by `requestMediaDataWhenReadyOnQueue`, which is the
+/// point. Feeding two `AVAssetWriterInput`s by hand does not work: the writer
+/// only frees one input as the other progresses, and anything pushing samples
+/// from outside — a method channel, say — deadlocks the moment one input goes
+/// not-ready. Measured from Dart, alternating stalled after 37 video frames
+/// and audio-first stalled after 95 audio frames. Letting the writer ask for
+/// data when *it* is ready is the only shape that works.
+- (void)muxVideo:(NSString *)videoPath
+       withAudio:(NSString *)audioPath
+              to:(NSString *)outputPath
+    audioBitrate:(int)audioBitrate
+          result:(FlutterResult)result
+{
+    NSError *error = nil;
+
+    AVURLAsset *videoAsset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:videoPath] options:nil];
+    AVURLAsset *audioAsset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:audioPath] options:nil];
+
+    AVAssetTrack *videoTrack = [[videoAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    AVAssetTrack *audioTrack = [[audioAsset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+    if (videoTrack == nil) {
+        result([FlutterError errorWithCode:@"MuxNoVideoTrack" message:videoPath details:nil]);
+        return;
+    }
+    if (audioTrack == nil) {
+        result([FlutterError errorWithCode:@"MuxNoAudioTrack" message:audioPath details:nil]);
+        return;
+    }
+
+    [[NSFileManager defaultManager] removeItemAtPath:outputPath error:nil];
+
+    AVAssetReader *videoReader = [AVAssetReader assetReaderWithAsset:videoAsset error:&error];
+    if (error) {
+        result([FlutterError errorWithCode:@"MuxReaderFailed" message:[error localizedDescription] details:nil]);
+        return;
+    }
+    // nil output settings: hand back the compressed samples untouched.
+    AVAssetReaderTrackOutput *videoOutput =
+        [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:videoTrack outputSettings:nil];
+    [videoReader addOutput:videoOutput];
+
+    AVAssetReader *audioReader = [AVAssetReader assetReaderWithAsset:audioAsset error:&error];
+    if (error) {
+        result([FlutterError errorWithCode:@"MuxReaderFailed" message:[error localizedDescription] details:nil]);
+        return;
+    }
+    AVAssetReaderTrackOutput *audioOutput =
+        [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:audioTrack
+                                                  outputSettings:@{
+                                                      AVFormatIDKey : @(kAudioFormatLinearPCM),
+                                                      AVLinearPCMIsBigEndianKey : @(NO),
+                                                      AVLinearPCMIsFloatKey : @(NO),
+                                                      AVLinearPCMBitDepthKey : @(16),
+                                                      AVLinearPCMIsNonInterleaved : @(NO),
+                                                  }];
+    [audioReader addOutput:audioOutput];
+
+    AVAssetWriter *writer = [AVAssetWriter assetWriterWithURL:[NSURL fileURLWithPath:outputPath]
+                                                     fileType:AVFileTypeMPEG4
+                                                        error:&error];
+    if (error) {
+        result([FlutterError errorWithCode:@"MuxWriterFailed" message:[error localizedDescription] details:nil]);
+        return;
+    }
+
+    // The format hint carries the H.264 parameter sets across, which is what
+    // makes a passthrough input legal without describing the codec again.
+    AVAssetWriterInput *videoInput =
+        [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
+                                           outputSettings:nil
+                                         sourceFormatHint:(__bridge CMFormatDescriptionRef)
+                                                              [[videoTrack formatDescriptions] firstObject]];
+    videoInput.expectsMediaDataInRealTime = NO;
+    // Preserve any rotation the encoder recorded.
+    videoInput.transform = videoTrack.preferredTransform;
+    if (![writer canAddInput:videoInput]) {
+        result([FlutterError errorWithCode:@"MuxVideoInputRejected" message:@"canAddInput was false" details:nil]);
+        return;
+    }
+    [writer addInput:videoInput];
+
+    const AudioStreamBasicDescription *sourceFormat =
+        CMAudioFormatDescriptionGetStreamBasicDescription(
+            (__bridge CMAudioFormatDescriptionRef)[[audioTrack formatDescriptions] firstObject]);
+    AVAssetWriterInput *audioInput =
+        [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
+                                           outputSettings:@{
+                                               AVFormatIDKey : @(kAudioFormatMPEG4AAC),
+                                               AVSampleRateKey : @(sourceFormat->mSampleRate),
+                                               AVNumberOfChannelsKey : @(sourceFormat->mChannelsPerFrame),
+                                               AVEncoderBitRateKey : @(audioBitrate),
+                                           }];
+    audioInput.expectsMediaDataInRealTime = NO;
+    if (![writer canAddInput:audioInput]) {
+        result([FlutterError errorWithCode:@"MuxAudioInputRejected" message:@"canAddInput was false" details:nil]);
+        return;
+    }
+    [writer addInput:audioInput];
+
+    if (![writer startWriting]) {
+        result([FlutterError errorWithCode:@"MuxStartFailed"
+                                   message:[[writer error] localizedDescription]
+                                   details:nil]);
+        return;
+    }
+    [writer startSessionAtSourceTime:kCMTimeZero];
+
+    // Both return values matter. `copyNextSampleBuffer` does not fail politely
+    // on a reader that never started — it throws NSInternalInconsistencyException
+    // from inside the writer's own dispatch queue, which is an uncatchable
+    // crash rather than an error the Dart side can see.
+    if (![videoReader startReading]) {
+        result([FlutterError errorWithCode:@"MuxVideoReadFailed"
+                                   message:[[videoReader error] localizedDescription]
+                                   details:videoPath]);
+        return;
+    }
+    if (![audioReader startReading]) {
+        result([FlutterError errorWithCode:@"MuxAudioReadFailed"
+                                   message:[[audioReader error] localizedDescription]
+                                   details:audioPath]);
+        return;
+    }
+
+    dispatch_group_t group = dispatch_group_create();
+
+    // Each block captures its *reader* as well as its output, and that is
+    // load-bearing rather than tidy. `requestMediaDataWhenReadyOnQueue` copies
+    // the block and retains what the block names — so naming only the output
+    // let both AVAssetReaders be deallocated the moment this method returned,
+    // leaving their outputs parented to nothing. `copyNextSampleBuffer` then
+    // throws NSInternalInconsistencyException, from the writer's own dispatch
+    // queue, where no @try can catch it: the whole app goes down complaining
+    // that the output was never added to a reader — which it was.
+    dispatch_group_enter(group);
+    dispatch_queue_t videoQueue = dispatch_queue_create("fqve.mux.video", DISPATCH_QUEUE_SERIAL);
+    [videoInput requestMediaDataWhenReadyOnQueue:videoQueue usingBlock:^{
+        while (videoInput.readyForMoreMediaData) {
+            if (videoReader.status != AVAssetReaderStatusReading) {
+                [videoInput markAsFinished];
+                dispatch_group_leave(group);
+                return;
+            }
+            CMSampleBufferRef buffer = [videoOutput copyNextSampleBuffer];
+            if (buffer == NULL) {
+                [videoInput markAsFinished];
+                dispatch_group_leave(group);
+                return;
+            }
+            BOOL ok = [videoInput appendSampleBuffer:buffer];
+            CFRelease(buffer);
+            if (!ok) {
+                [videoInput markAsFinished];
+                dispatch_group_leave(group);
+                return;
+            }
+        }
+    }];
+
+    dispatch_group_enter(group);
+    dispatch_queue_t audioQueue = dispatch_queue_create("fqve.mux.audio", DISPATCH_QUEUE_SERIAL);
+    [audioInput requestMediaDataWhenReadyOnQueue:audioQueue usingBlock:^{
+        while (audioInput.readyForMoreMediaData) {
+            if (audioReader.status != AVAssetReaderStatusReading) {
+                [audioInput markAsFinished];
+                dispatch_group_leave(group);
+                return;
+            }
+            CMSampleBufferRef buffer = [audioOutput copyNextSampleBuffer];
+            if (buffer == NULL) {
+                [audioInput markAsFinished];
+                dispatch_group_leave(group);
+                return;
+            }
+            BOOL ok = [audioInput appendSampleBuffer:buffer];
+            CFRelease(buffer);
+            if (!ok) {
+                [audioInput markAsFinished];
+                dispatch_group_leave(group);
+                return;
+            }
+        }
+    }];
+
+    dispatch_group_notify(group, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [writer finishWritingWithCompletionHandler:^{
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (writer.status == AVAssetWriterStatusCompleted) {
+                    result(@(true));
+                } else {
+                    NSError *failure = writer.error;
+                    result([FlutterError errorWithCode:@"MuxFinishFailed"
+                                               message:failure ? [failure localizedDescription] : @"Unknown error"
+                                               details:nil]);
+                }
+            });
+        }];
+    });
 }
 
 - (NSString*)parseProfileLevel:(NSString*)str {
@@ -539,20 +755,39 @@ CMSampleBufferRef createAudioSampleBuffer(int fps, int frameIdx, int audioChanne
 {
     int numSamples = (int)[audioSampleData length] / sizeof(int16_t);
 
+    // Own a copy of the samples rather than wrapping the caller's.
+    //
+    // This passed the NSData's bytes with kCFAllocatorNull as the block
+    // allocator, which tells CoreMedia to neither copy them nor take
+    // responsibility for freeing them. Those bytes belong to the method
+    // channel's argument and are gone once the call returns, while
+    // AVAssetWriterInput retains the sample buffer and reads it whenever it
+    // gets to it. Every audio frame was a use-after-free — latent until now,
+    // because nothing had ever appended one.
     CMBlockBufferRef blockBuffer = NULL;
     OSStatus status = CMBlockBufferCreateWithMemoryBlock(
                          kCFAllocatorDefault,
-                         (void *)[audioSampleData bytes],
+                         NULL, // let CoreMedia allocate, so the block owns it
                          [audioSampleData length],
-                         kCFAllocatorNull,
+                         kCFAllocatorDefault,
                          NULL,
                          0,
                          [audioSampleData length],
-                         0,
+                         kCMBlockBufferAssureMemoryNowFlag,
                          &blockBuffer);
 
     if (status != kCMBlockBufferNoErr) {
         NSLog(@"Failed to create block buffer: %d", status);
+        return NULL;
+    }
+
+    status = CMBlockBufferReplaceDataBytes([audioSampleData bytes],
+                                           blockBuffer,
+                                           0,
+                                           [audioSampleData length]);
+    if (status != kCMBlockBufferNoErr) {
+        NSLog(@"Failed to copy audio into block buffer: %d", status);
+        CFRelease(blockBuffer);
         return NULL;
     }
 
