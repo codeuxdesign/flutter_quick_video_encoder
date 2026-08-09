@@ -879,13 +879,32 @@ static void blendClipIntoFrame(uint8_t *dst,
             const uint8_t *s = src + (size_t)sy * srcStride + (size_t)sx * 4;
             uint8_t *d = dst + ((size_t)dy * frameWidth + dx) * 4;
 
-            // Destination is RGBA straight; the clip arrives BGRA.
+            // Destination is RGBA **straight**; the clip arrives BGRA.
+            //
+            // The overlay is weighted by its own alpha, and that word is the
+            // whole bug this line used to carry. `d + s * inv` is the *premul*
+            // form of source-over — correct when the destination's colour has
+            // already been multiplied by its coverage. `renderSingleFrame`
+            // reads back `rawStraightRgba` on purpose, so a half-cleared pixel
+            // still holds its colour at full strength and half the clip was
+            // being *added* to a whole map. Past 255 the uint8_t wrapped, each
+            // channel independently, which is why it did not read as
+            // washed-out but as magenta and cyan confetti.
+            //
+            // It was invisible for as long as a hole was cleared outright:
+            // alpha was only ever 0 or 255, and at 0 the painter had zeroed the
+            // colour too, so the two formulas agree. Introducing a *partial*
+            // clear to crossfade a clip is what made a fractional alpha
+            // possible, and the corruption appeared at exactly the fades and
+            // nowhere else.
+            //
+            // `a + inv == 255`, so this cannot overflow by construction.
             int a = d[3];
             if (a == 255) { continue; }
             int inv = 255 - a;
-            d[0] = (uint8_t)(d[0] + (s[2] * inv) / 255);
-            d[1] = (uint8_t)(d[1] + (s[1] * inv) / 255);
-            d[2] = (uint8_t)(d[2] + (s[0] * inv) / 255);
+            d[0] = (uint8_t)((d[0] * a + s[2] * inv) / 255);
+            d[1] = (uint8_t)((d[1] * a + s[1] * inv) / 255);
+            d[2] = (uint8_t)((d[2] * a + s[0] * inv) / 255);
             d[3] = 255;
         }
     }
