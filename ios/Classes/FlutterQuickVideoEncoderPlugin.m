@@ -17,6 +17,98 @@
 CMSampleBufferRef createVideoSampleBuffer(int fps, int videoFrameIdx, int width, int height, NSData *videoFrameData);
 CMSampleBufferRef createAudioSampleBuffer(int fps, int audioFrameIdx, int audioChannels, int sampleRate, NSData *audioSampleData);
 
+@class FQVEClipReader;
+
+// Defined below, used in `appendVideoFrame` above it.
+static void blendClipIntoFrame(uint8_t *dst, int frameWidth, int frameHeight,
+                               CVPixelBufferRef clip, int rx, int ry, int rw,
+                               int rh, int quarterTurns);
+
+/// One clip, decoded forward, holding the frame that is currently on screen.
+///
+/// **Rec.709 is asked for, not assumed.** A modern action cam or drone writes
+/// BT.2020 with an HLG transfer, and `kCVPixelFormatType_32BGRA` alone hands
+/// those bytes back untouched — the buffer arrives tagged `ITU_R_2100_HLG` and
+/// blending it into an sRGB frame produces a washed-out, flat picture with no
+/// error anywhere. `AVVideoColorPropertiesKey` moves the tone map into the
+/// reader, on hardware, for no measurable cost.
+@interface FQVEClipReader : NSObject
+@property(nonatomic) AVAssetReader *reader;
+@property(nonatomic) AVAssetReaderTrackOutput *output;
+@property(nonatomic) CVPixelBufferRef current;
+@property(nonatomic) CMTime currentEnd;
+@end
+
+@implementation FQVEClipReader
+
+- (instancetype)initWithPath:(NSString *)path {
+    self = [super init];
+    if (!self) { return nil; }
+
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    if (!track) { return nil; }
+
+    NSError *error = nil;
+    // **Named on `self`, not just captured locally.** A reader that outlives
+    // only its output deallocates when the method returns, and
+    // `copyNextSampleBuffer` then raises from the writer's own dispatch queue,
+    // where no `@try` reaches it and the app dies rather than returning an
+    // error. That exact bug has been paid for once in this file already.
+    self.reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
+    if (!self.reader) { return nil; }
+
+    self.output = [[AVAssetReaderTrackOutput alloc]
+        initWithTrack:track
+       outputSettings:@{
+           (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+           AVVideoColorPropertiesKey : @{
+               AVVideoColorPrimariesKey : AVVideoColorPrimaries_ITU_R_709_2,
+               AVVideoTransferFunctionKey : AVVideoTransferFunction_ITU_R_709_2,
+               AVVideoYCbCrMatrixKey : AVVideoYCbCrMatrix_ITU_R_709_2,
+           },
+       }];
+    self.output.alwaysCopiesSampleData = NO;
+    if (![self.reader canAddOutput:self.output]) { return nil; }
+    [self.reader addOutput:self.output];
+    if (![self.reader startReading]) { return nil; }
+
+    self.currentEnd = kCMTimeZero;
+    return self;
+}
+
+/// The frame covering [time], decoded forward from wherever the reader is.
+///
+/// Holds the last sample rather than decoding one per call, because several
+/// output frames land inside one source frame whenever the film runs slower
+/// than the clip — and because a source that has run out should keep showing
+/// its final frame rather than vanish.
+- (CVPixelBufferRef)frameAtTime:(CMTime)time {
+    while (CMTIME_COMPARE_INLINE(self.currentEnd, <=, time)) {
+        CMSampleBufferRef sample = [self.output copyNextSampleBuffer];
+        if (!sample) { break; }
+        CVPixelBufferRef image = CMSampleBufferGetImageBuffer(sample);
+        if (image) {
+            CVPixelBufferRetain(image);
+            if (self.current) { CVPixelBufferRelease(self.current); }
+            self.current = image;
+            CMTime start = CMSampleBufferGetPresentationTimeStamp(sample);
+            CMTime dur = CMSampleBufferGetDuration(sample);
+            self.currentEnd = CMTIME_IS_NUMERIC(dur) ? CMTimeAdd(start, dur)
+                                                     : CMTimeAdd(start, CMTimeMake(1, 120));
+        }
+        CFRelease(sample);
+    }
+    return self.current;
+}
+
+- (void)dealloc {
+    if (self.current) { CVPixelBufferRelease(self.current); }
+    [self.reader cancelReading];
+}
+
+@end
+
 typedef NS_ENUM(NSUInteger, LogLevel) {
     none = 0,
     error = 1,
@@ -37,6 +129,14 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 @property(nonatomic) int height;
 @property(nonatomic) int fps;
 @property(nonatomic) int audioChannels;
+
+/// One sequential clip reader per source path, keyed by path.
+///
+/// **Sequential, never seeking.** A clip plays forward, so the reader walks the
+/// file the way it was written and every frame costs one `copyNextSampleBuffer`.
+/// Seeking per frame would re-open a decode session for each of them, which on
+/// a 4K HEVC file is the difference between three milliseconds and forty.
+@property(nonatomic) NSMutableDictionary<NSString *, FQVEClipReader *> *mClipReaders;
 @property(nonatomic) int sampleRate;
 @end
 
@@ -222,6 +322,9 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             NSDictionary *args = (NSDictionary*)call.arguments;
             FlutterStandardTypedData *rawRgbaData = args[@"rawRgba"];
             NSData *videoFrameData = rawRgbaData.data;
+            if (!self.mClipReaders) {
+                self.mClipReaders = [NSMutableDictionary dictionary];
+            }
 
             // Check if the asset writer is initialized
             if (!self.mAssetWriter) {
@@ -252,6 +355,46 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             if (self.mAssetWriter.status != AVAssetWriterStatusWriting) {
                 [self.mAssetWriter startWriting];
                 [self.mAssetWriter startSessionAtSourceTime:kCMTimeZero];
+            }
+
+            // Fill the caller's holes with video before anything is encoded.
+            //
+            // **A mutable copy, made now.** `videoFrameData` is the `NSData` off
+            // a `FlutterStandardTypedData` and lives only for this call; the
+            // blend writes into it, so it cannot be the caller's bytes. The copy
+            // is also what keeps this safe if the runloop below ever re-enters.
+            NSArray *holes = args[@"holes"];
+            if (holes.count > 0) {
+                NSMutableData *composited = [videoFrameData mutableCopy];
+                uint8_t *dst = (uint8_t *)composited.mutableBytes;
+                for (NSDictionary *hole in holes) {
+                    NSString *path = hole[@"path"];
+                    if (![path isKindOfClass:[NSString class]]) { continue; }
+
+                    FQVEClipReader *reader = self.mClipReaders[path];
+                    if (!reader) {
+                        reader = [[FQVEClipReader alloc] initWithPath:path];
+                        // A source that will not open leaves the rect as the
+                        // painter left it — transparent — rather than failing
+                        // the whole export. The frame is visibly wrong, which
+                        // is the point: a clip that cannot be read should not
+                        // look like a clip that is simply dark.
+                        if (!reader) { continue; }
+                        self.mClipReaders[path] = reader;
+                    }
+
+                    int64_t us = [hole[@"sourceTimeUs"] longLongValue];
+                    CVPixelBufferRef clip =
+                        [reader frameAtTime:CMTimeMake(us, 1000000)];
+
+                    blendClipIntoFrame(dst, self.width, self.height, clip,
+                                       [hole[@"x"] intValue],
+                                       [hole[@"y"] intValue],
+                                       [hole[@"w"] intValue],
+                                       [hole[@"h"] intValue],
+                                       [hole[@"quarterTurns"] intValue]);
+                }
+                videoFrameData = composited;
             }
 
             // Create video sample buffer from the provided data
@@ -376,6 +519,15 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         }
         else if ([@"finish" isEqualToString:call.method])
         {
+            // Let the clip readers go with the film they were opened for.
+            //
+            // Each holds a decode session and a retained pixel buffer, and a
+            // 4K source is tens of megabytes of them. Keeping the map across
+            // exports would leak a session per source per film — and worse,
+            // a second export of the same file would resume the first one's
+            // reader partway through rather than starting at the beginning.
+            [self.mClipReaders removeAllObjects];
+
             // Check if the asset writer is initialized
             if (!self.mAssetWriter) {
                 result([FlutterError errorWithCode:@"AssetWriterUnavailable"
@@ -664,6 +816,82 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     else                                                 {return AVVideoProfileLevelH264BaselineAutoLevel;}
 }
 @end
+
+
+/// Composites one clip frame under the overlay, inside one rectangle.
+///
+/// **Source-over, and the overlay is straight alpha.** The painter cleared the
+/// rectangle, so the overlay is transparent there and `out = over + clip*(1-a)`
+/// reduces to the clip in the middle while blending correctly along the
+/// antialiased edge. That is the whole reason the rect is cleared rather than
+/// skipped: a skipped rect would still hold the basemap, and this arithmetic
+/// would then blend the clip with a map nobody wants to see.
+///
+/// Nearest-neighbour sampling. The destination is smaller than a 4K source by a
+/// wide margin, so this is a downscale, and a bilinear tap would cost four
+/// reads per pixel to soften an image the encoder is about to requantise
+/// anyway. Worth revisiting only if a clip is ever scaled up.
+static void blendClipIntoFrame(uint8_t *dst,
+                               int frameWidth,
+                               int frameHeight,
+                               CVPixelBufferRef clip,
+                               int rx, int ry, int rw, int rh,
+                               int quarterTurns)
+{
+    if (!clip || rw <= 0 || rh <= 0) { return; }
+
+    CVPixelBufferLockBaseAddress(clip, kCVPixelBufferLock_ReadOnly);
+    const uint8_t *src = (const uint8_t *)CVPixelBufferGetBaseAddress(clip);
+    size_t srcStride = CVPixelBufferGetBytesPerRow(clip);
+    int srcW = (int)CVPixelBufferGetWidth(clip);
+    int srcH = (int)CVPixelBufferGetHeight(clip);
+    if (!src || srcW <= 0 || srcH <= 0) {
+        CVPixelBufferUnlockBaseAddress(clip, kCVPixelBufferLock_ReadOnly);
+        return;
+    }
+
+    // A quarter turn swaps which source axis each destination axis walks. The
+    // rect is already the turned shape, because `displayAspect` applied the
+    // rotation, so only the sampling has to know about it.
+    int turns = ((quarterTurns % 4) + 4) % 4;
+
+    for (int y = 0; y < rh; y++) {
+        int dy = ry + y;
+        if (dy < 0 || dy >= frameHeight) { continue; }
+        for (int x = 0; x < rw; x++) {
+            int dx = rx + x;
+            if (dx < 0 || dx >= frameWidth) { continue; }
+
+            float u = (x + 0.5f) / rw;
+            float v = (y + 0.5f) / rh;
+            float su, sv;
+            switch (turns) {
+                case 1:  su = v;        sv = 1.0f - u;  break;
+                case 2:  su = 1.0f - u; sv = 1.0f - v;  break;
+                case 3:  su = 1.0f - v; sv = u;         break;
+                default: su = u;        sv = v;         break;
+            }
+            int sx = (int)(su * srcW);
+            int sy = (int)(sv * srcH);
+            if (sx < 0) { sx = 0; } else if (sx >= srcW) { sx = srcW - 1; }
+            if (sy < 0) { sy = 0; } else if (sy >= srcH) { sy = srcH - 1; }
+
+            const uint8_t *s = src + (size_t)sy * srcStride + (size_t)sx * 4;
+            uint8_t *d = dst + ((size_t)dy * frameWidth + dx) * 4;
+
+            // Destination is RGBA straight; the clip arrives BGRA.
+            int a = d[3];
+            if (a == 255) { continue; }
+            int inv = 255 - a;
+            d[0] = (uint8_t)(d[0] + (s[2] * inv) / 255);
+            d[1] = (uint8_t)(d[1] + (s[1] * inv) / 255);
+            d[2] = (uint8_t)(d[2] + (s[0] * inv) / 255);
+            d[3] = 255;
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(clip, kCVPixelBufferLock_ReadOnly);
+}
 
 
 CMSampleBufferRef createVideoSampleBuffer(int fps, int frameIdx, int width, int height, NSData *videoFrameData)

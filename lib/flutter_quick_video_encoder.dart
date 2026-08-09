@@ -91,10 +91,27 @@ class FlutterQuickVideoEncoder {
   }
 
   /// append raw rgba video frame, 8 bits per channel
-  static Future<void> appendVideoFrame(Uint8List rawRgba) async {
+  /// append one frame of straight-alpha RGBA
+  ///
+  /// [holes] are rectangles the caller wants filled with video rather than with
+  /// its own pixels. Each is a map of:
+  ///
+  ///  - `path`          absolute path to the source file
+  ///  - `sourceTimeUs`  how far into that file this frame is
+  ///  - `x`,`y`,`w`,`h` destination rectangle, in pixels of this frame
+  ///  - `quarterTurns`  how far to turn the source clockwise, 0-3
+  ///
+  /// The decoded clip is composited *under* [rawRgba] inside each rectangle, so
+  /// the caller is expected to have cleared it — straight alpha means ordinary
+  /// source-over, and a cleared rect is what lets the clip show through.
+  static Future<void> appendVideoFrame(
+    Uint8List rawRgba, {
+    List<Map<String, Object>> holes = const [],
+  }) async {
     assert(rawRgba.length == width * height * 4, "invalid data length");
     return await _invokeMethod('appendVideoFrame', {
       'rawRgba': rawRgba,
+      'holes': holes,
     });
   }
 
