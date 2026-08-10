@@ -382,13 +382,23 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             // would place it up to its own interval away from where it
             // happened. `thermalState` is a cheap property read here, unlike
             // Android's binder call, so per-frame costs nothing.
-            NSNumber *thermalLevel = currentThermalState()[@"level"];
-            if (![thermalLevel isEqualToNumber:self.mThermalLevel]) {
+            // **`isEqual:`, not `isEqualToNumber:`.** The typed comparison
+            // raises `NSInvalidArgumentException` on a nil argument, and
+            // `mThermalLevel` is nil on the first frame by construction — that
+            // is how the line knows to state where it began. The exception was
+            // then caught by this method's own `@try`, returned to Dart as a
+            // FlutterError, and the export stopped after exactly one frame with
+            // nothing in the log but `handleMethodCall: appendVideoFrame`.
+            //
+            // It compiled, and it read correctly. Only running it said
+            // otherwise, which is the whole argument for running it.
+            NSDictionary *thermal = currentThermalState();
+            if (![thermal[@"level"] isEqual:self.mThermalLevel]) {
                 NSLog(@"THERMAL %@ frame=%d (was %@)",
-                      currentThermalState()[@"name"], self.videoFrameIdx,
+                      thermal[@"name"], self.videoFrameIdx,
                       self.mThermalName ?: @"-");
-                self.mThermalLevel = thermalLevel;
-                self.mThermalName = currentThermalState()[@"name"];
+                self.mThermalLevel = thermal[@"level"];
+                self.mThermalName = thermal[@"name"];
             }
 
             // Check if the asset writer is initialized
