@@ -62,7 +62,18 @@ static AVAssetTrack *FQVEFirstTrack(AVURLAsset *asset, AVMediaType type) {
               asset.URL.lastPathComponent, error);
         return nil;
     }
-    return [[asset tracksWithMediaType:type] firstObject];
+    AVAssetTrack *track = [[asset tracksWithMediaType:type] firstObject];
+    if (!track) {
+        // Say this positively. The two ways to get nil from here are "the tracks
+        // never loaded" and "they loaded and there are none", and they call for
+        // opposite fixes — the first is this function's bug, the second means the
+        // file really is trackless and the encoder wrote nothing. Without this
+        // line the second case is diagnosed by the *absence* of the two above it,
+        // which is not a thing anyone reads a log for.
+        NSLog(@"FQVE: %@ loaded its tracks and has no %@ track",
+              asset.URL.lastPathComponent, type);
+    }
+    return track;
 }
 
 /// This device's thermal state, on a scale both platforms share.
