@@ -63,6 +63,22 @@ final class ThermalWatch {
     private long lastSampleNanos;
     private volatile int frameIndex;
 
+    /**
+     * Told about every transition, so the row and the gauge cannot disagree.
+     *
+     * <p>The alternative was Dart polling `thermalStatus` once a frame, which is
+     * a method-channel round trip per frame to answer a question that changes
+     * three times in an export. Pushing is cheaper than that by four orders of
+     * magnitude and it is also *earlier* — a poll reports the transition on the
+     * next frame, and the frame it happened on is the number that explains the
+     * slowdown.
+     */
+    interface Listener {
+        void onThermalChanged(int level, String name, boolean throttling, float headroom);
+    }
+
+    private Listener sink;
+
     private ThermalWatch(PowerManager power) {
         this.power = power;
         this.status = power.getCurrentThermalStatus();
@@ -71,8 +87,35 @@ final class ThermalWatch {
             public void onThermalStatusChanged(int value) {
                 status = value;
                 report(true);
+                emit();
             }
         };
+    }
+
+    /**
+     * Starts pushing to [listener], and pushes the current state immediately.
+     *
+     * <p>Immediately, because a subscriber that arrives mid-render would
+     * otherwise wait for the next transition to learn anything — and on a device
+     * that has already reached its ceiling, the next transition may never come.
+     */
+    void listen(Listener listener) {
+        this.sink = listener;
+        emit();
+    }
+
+    void stopListening() {
+        this.sink = null;
+    }
+
+    private void emit() {
+        final Listener listener = sink;
+        if (listener == null) {
+            return;
+        }
+        final int now = status;
+        listener.onThermalChanged(
+                level(now), describe(now), worthReporting(now), currentHeadroom());
     }
 
     /** A watch, or null where the platform cannot answer. */

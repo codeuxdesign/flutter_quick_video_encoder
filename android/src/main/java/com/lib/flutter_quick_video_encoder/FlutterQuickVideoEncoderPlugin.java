@@ -25,6 +25,7 @@ import java.util.Queue;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.BinaryMessenger;
+import io.flutter.plugin.common.EventChannel;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 
@@ -55,8 +56,12 @@ public class FlutterQuickVideoEncoderPlugin implements
 {
     private static final String TAG = "[FQVE-Android]";
     private static final String CHANNEL_NAME = "flutter_quick_video_encoder/methods";
+    private static final String THERMAL_CHANNEL_NAME = "flutter_quick_video_encoder/thermal";
 
     private MethodChannel mMethodChannel;
+    private EventChannel mThermalChannel;
+    private final android.os.Handler mMainHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
     private int mWidth;
     private int mHeight;
     private int mFps;
@@ -102,6 +107,45 @@ public class FlutterQuickVideoEncoderPlugin implements
         mMethodChannel = new MethodChannel(messenger, CHANNEL_NAME);
         mMethodChannel.setMethodCallHandler(this);
         mThermal = ThermalWatch.of(binding.getApplicationContext());
+
+        // **Pushed, not polled, and one source for two consumers.** The perf row
+        // wants the transitions to build a trace; the Export screen wants the
+        // current rung to draw a gauge. Asking twice invites the two to
+        // disagree, and polling per frame would be a channel round trip to
+        // answer a question that changes three times in an export.
+        mThermalChannel = new EventChannel(messenger, THERMAL_CHANNEL_NAME);
+        mThermalChannel.setStreamHandler(new EventChannel.StreamHandler() {
+            @Override
+            public void onListen(Object arguments, EventChannel.EventSink events) {
+                if (mThermal == null) {
+                    // A device that cannot answer says so once rather than
+                    // going quiet, which reads the same as "never throttled".
+                    events.error("ThermalUnavailable",
+                            "this device does not report thermal status", null);
+                    return;
+                }
+                mThermal.listen((level, name, throttling, headroom) -> {
+                    Map<String, Object> event = new java.util.LinkedHashMap<>();
+                    event.put("level", level);
+                    event.put("name", name);
+                    event.put("throttling", throttling);
+                    if (!Float.isNaN(headroom)) {
+                        event.put("headroom", (double) headroom);
+                    }
+                    // The sink is not thread-safe and the listener fires on the
+                    // platform's own thread, so hop deliberately rather than
+                    // hoping they coincide.
+                    mMainHandler.post(() -> events.success(event));
+                });
+            }
+
+            @Override
+            public void onCancel(Object arguments) {
+                if (mThermal != null) {
+                    mThermal.stopListening();
+                }
+            }
+        });
     }
 
     @Override

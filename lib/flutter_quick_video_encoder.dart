@@ -30,6 +30,41 @@ enum ProfileLevel {
 class FlutterQuickVideoEncoder {
   static const MethodChannel _channel = const MethodChannel('flutter_quick_video_encoder/methods');
 
+  static const EventChannel _thermalChannel = const EventChannel(
+    'flutter_quick_video_encoder/thermal',
+  );
+
+  /// Every change in how hard the device is limiting itself.
+  ///
+  /// Pushed by the platform rather than polled, and the first event arrives on
+  /// subscription so a listener that joins mid-render learns where it already
+  /// is — on a device that has reached its ceiling, the next transition may
+  /// never come.
+  ///
+  /// Each event carries:
+  ///
+  ///  - `level`      0..3, and **the only field two platforms may be compared
+  ///                 on**. Apple reports four states and Android seven, so the
+  ///                 mapping happens where that knowledge lives rather than in
+  ///                 the caller: nominal/fair/serious/critical against
+  ///                 NONE/LIGHT/MODERATE/SEVERE-and-above.
+  ///  - `name`       the platform's own word, for a log a human reads.
+  ///  - `throttling` whether it is worth telling a rider about, which is level
+  ///                 two and up. Below that is normal under any sustained load
+  ///                 and saying so would only teach people to ignore it.
+  ///  - `headroom`   how close to the threshold, 1.0 being at it. **Android
+  ///                 only, and absent rather than invented elsewhere** —
+  ///                 Apple has no forecast, and a gauge showing a made-up
+  ///                 number cannot be unseen.
+  ///
+  /// Errors with `ThermalUnavailable` where the platform cannot answer, rather
+  /// than going quiet — silence reads identically to "never throttled", which
+  /// is the one thing it must not be mistaken for.
+  static Stream<Map<String, Object?>> get thermalChanges =>
+      _thermalChannel.receiveBroadcastStream().map(
+            (event) => Map<String, Object?>.from(event as Map),
+          );
+
   // setup values
   static int width = 0;
   static int height = 0;
