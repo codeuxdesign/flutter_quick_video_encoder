@@ -152,6 +152,16 @@ final class ClipReader {
         // keeps asking past the end would otherwise seek on every frame, each
         // one landing on the same last sync sample.
         final boolean farAhead = !outputDone && timeUs > from + SEEK_AHEAD_US;
+        // **Comparing against the held frame is safe here, and is not on Apple.**
+        // The loop below only adopts a frame whose timestamp is at or before the
+        // instant asked for, so `current.presentationTimeUs <= timeUs` holds
+        // after every call and a repeated instant can never read as a scrub
+        // backwards. The Apple reader selects on the frame's *end* instead, and
+        // sample durations do not always tile — measured on a 120 fps drone clip,
+        // the frame covering 30.000s reports a start of 30.0007s — so there the
+        // same comparison rebuilt the reader to answer with the frame it was
+        // already holding, at 79 ms a time. It is tracked against the requested
+        // instant there for that reason; the two are not gratuitously different.
         if (from == Long.MIN_VALUE || timeUs < from || farAhead) {
             seekTo(timeUs);
         }

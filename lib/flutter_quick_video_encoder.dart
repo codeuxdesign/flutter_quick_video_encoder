@@ -27,6 +27,39 @@ enum ProfileLevel {
   baselineAutoLevel,
 }
 
+/// One decoded clip frame, downsampled far enough to hand to a widget.
+///
+/// [rgba] is straight RGBA, row major, no padding, alpha 255 throughout —
+/// `width * height * 4` bytes, ready for `decodeImageFromPixels` with
+/// `PixelFormat.rgba8888`.
+///
+/// **[width] and [height] are the frame's own, not the caller's request.** A
+/// decoded frame carries a crop rectangle, so the area a decoder hands back is
+/// not always the size the container advertises, and the downsample rounds. A
+/// caller that assumed `maxEdge` square, or assumed the track's natural size,
+/// would lay the bytes out sheared.
+///
+/// **The pixels are in the file's stored orientation.** Rotation is metadata
+/// the container carries beside the samples, and the export applies it in
+/// `appendVideoFrame`'s `quarterTurns` rather than in the reader — so a preview
+/// that turned the frame here would be showing something the export does not
+/// draw. Turn it in the widget with the same `quarterTurns` the hole will
+/// carry.
+class ClipPreviewFrame {
+  const ClipPreviewFrame({
+    required this.rgba,
+    required this.width,
+    required this.height,
+  });
+
+  final Uint8List rgba;
+  final int width;
+  final int height;
+
+  @override
+  String toString() => 'ClipPreviewFrame(${width}x$height)';
+}
+
 class FlutterQuickVideoEncoder {
   static const MethodChannel _channel = const MethodChannel('flutter_quick_video_encoder/methods');
 
@@ -196,6 +229,81 @@ class FlutterQuickVideoEncoder {
     };
   }
 
+  /// The frame [path] shows at [at], as pixels a widget can draw.
+  ///
+  /// Null when the clip cannot be opened or decoded — the same conditions
+  /// [checkClipsDecodable] reports, and for the same reasons.
+  ///
+  /// **This is the export's answer, not a second opinion.** It runs the same
+  /// reader, the same seek and the same YCbCr conversion `appendVideoFrame`
+  /// runs, so the frame a rider trims against is the frame the film will show.
+  /// A general-purpose player would be easier and is the wrong tool: it decodes
+  /// with its own color pipeline, and a preview that disagrees with the export
+  /// by even a frame is worse than no preview at all, because the rider is
+  /// making a decision against it.
+  ///
+  /// **The frame is tone-mapped to SDR**, because that is what the export
+  /// writes. An HLG or PQ source is run through Report ITU-R BT.2446-1 Method A
+  /// on the way to sRGB, exactly as the composite does. If HDR output ever
+  /// ships, this has to follow the chosen output space or it stops being a
+  /// promise about the film.
+  ///
+  /// [maxEdge] caps the longer side, and the frame is downsampled
+  /// nearest-neighbor to fit — the same sampling the composite uses. It is not
+  /// a formality: a 4K frame is 33 MB of RGBA, which is a jetsam risk to hand
+  /// across the method channel per scrub position and pointless for a preview a
+  /// few hundred pixels wide. A frame already smaller than [maxEdge] is passed
+  /// through at its own size rather than scaled up.
+  ///
+  /// **Readers are cached by path and have to be let go explicitly**, see
+  /// [releaseClipPreviews]. Measured on macOS against a 4K HEVC Main10 clip,
+  /// opening the file costs about 250 ms while seeking inside an already-open
+  /// reader costs a fraction of that, so a handle that reopened per call would
+  /// feel stuck. The cache is bounded and separate from the export's, and
+  /// [setup] drops it, so a preview can never be holding the decoder an export
+  /// wants.
+  static Future<ClipPreviewFrame?> clipFrameAt(
+    String path,
+    Duration at, {
+    int maxEdge = 512,
+  }) async {
+    if (maxEdge <= 0) {
+      throw ArgumentError.value(maxEdge, 'maxEdge', 'must be positive');
+    }
+    final result = await _invokeMethod<Map<Object?, Object?>>('clipFrameAt', {
+      'path': path,
+      // Clamped rather than passed through. A negative instant is a caller
+      // whose trim handle ran off the left edge, and both platforms would read
+      // it as "before the first sample" anyway — answering with the first frame
+      // is what the handle is pointing at.
+      'atUs': at.inMicroseconds < 0 ? 0 : at.inMicroseconds,
+      'maxEdge': maxEdge,
+    });
+    if (result == null) {
+      return null;
+    }
+    return ClipPreviewFrame(
+      rgba: result['rgba'] as Uint8List,
+      width: result['width'] as int,
+      height: result['height'] as int,
+    );
+  }
+
+  /// Closes every decoder [clipFrameAt] left open.
+  ///
+  /// **Required, not advisable.** A phone has a small, device-specific number
+  /// of concurrent hardware video decoders — often one or two at 4K — and a
+  /// held one is a decoder the next clip, or the next app, cannot have. Call it
+  /// when the screen that was scrubbing goes away.
+  ///
+  /// The one failure it does *not* have to guard against is an export starting
+  /// while previews are open: [setup] releases them itself, because "the film
+  /// refused because a screen you already left was still holding a decoder" is
+  /// not a thing anyone could diagnose.
+  static Future<void> releaseClipPreviews() async {
+    return await _invokeMethod('releaseClipPreviews');
+  }
+
   /// append raw pcm audio samples
   ///  - 16 bit, little-endiant
   ///  - when using stereo audio, samples should be interleaved left channel first
@@ -271,7 +379,22 @@ class FlutterQuickVideoEncoder {
 
     // log result
     if (logLevel.index >= LogLevel.standard.index) {
-      print("[FQVE] <$method> result: $result");
+      if (method == "clipFrameAt" && result is Map) {
+        // **Summarized, because the whole thing is a frame.** The argument log
+        // above already refuses to print `rawRgba`; the result log had no such
+        // case because nothing used to answer with pixels. At the default log
+        // level a single 512px preview printed 590 KB of decimal bytes, and a
+        // `maxEdge` large enough to pass a 4K frame through printed enough to
+        // take the run down with it — a diagnostic that kills the thing it is
+        // diagnosing, in the one method that is called per scrub position.
+        print(
+          "[FQVE] <$method> result: "
+          "${result['width']}x${result['height']}, "
+          "${(result['rgba'] as Uint8List?)?.length ?? 0} bytes",
+        );
+      } else {
+        print("[FQVE] <$method> result: $result");
+      }
     }
 
     return result;

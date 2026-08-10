@@ -88,6 +88,15 @@ public class FlutterQuickVideoEncoderPlugin implements
     private ClipCompositor mClipCompositor;
 
     /**
+     * Decoders held open for a trim handle, or null until one is asked for.
+     *
+     * <p>Separate from {@link #mClipCompositor} on purpose — the two read the
+     * same files in opposite patterns — and released whenever an export sets up,
+     * so a screen that forgot to let go cannot starve the film of a decoder.
+     */
+    private ClipPreviewCache mClipPreviews;
+
+    /**
      * Says when the phone starts throttling, so a slower render has a reason
      * attached to it rather than being a number nobody can account for.
      */
@@ -152,6 +161,10 @@ public class FlutterQuickVideoEncoderPlugin implements
     public void onDetachedFromEngine(FlutterPluginBinding binding) {
         mMethodChannel.setMethodCallHandler(null);
         releaseClipCompositor();
+        if (mClipPreviews != null) {
+            mClipPreviews.shutdown();
+            mClipPreviews = null;
+        }
         if (mThermal != null) {
             mThermal.close();
             mThermal = null;
@@ -162,6 +175,19 @@ public class FlutterQuickVideoEncoderPlugin implements
         if (mClipCompositor != null) {
             mClipCompositor.release();
             mClipCompositor = null;
+        }
+    }
+
+    /**
+     * Hands back every preview decoder, keeping the worker thread.
+     *
+     * <p>The cache itself is kept rather than dropped: the thread is the
+     * expensive part of it and the readers are what hold hardware, so a screen
+     * that scrubs, exports and scrubs again pays for one thread rather than two.
+     */
+    private void releaseClipPreviews() {
+        if (mClipPreviews != null) {
+            mClipPreviews.release();
         }
     }
 
@@ -184,6 +210,14 @@ public class FlutterQuickVideoEncoderPlugin implements
                     // reset
                     stopProcessingThread();
                     releaseClipCompositor();
+                    // And the preview readers with them. A phone has a small,
+                    // device-specific supply of concurrent 4K decoders, so a
+                    // Clips screen that is still holding one is a clip this
+                    // export will not be able to open — and that surfaces as an
+                    // unrelated file failing, which is the wrong diagnosis every
+                    // time. Cheap: the screen is not scrubbing during an export,
+                    // so nothing reopens.
+                    releaseClipPreviews();
 
                     // Extract parameters
                     int width =         call.argument("width");
@@ -417,6 +451,47 @@ public class FlutterQuickVideoEncoderPlugin implements
                             ? new java.util.LinkedHashMap<String, String>()
                             : ClipCompositor.undecodable(paths);
                     result.success(failures);
+                    break;
+                }
+                case "clipFrameAt":
+                {
+                    // One decode per scrub position, through the reader the
+                    // export uses. A second decoder would be easier and is the
+                    // wrong answer: the rider is choosing a trim against this
+                    // picture, so it has to be the picture the film will show,
+                    // down to the color conversion.
+                    String path = call.argument("path");
+                    Number atUs = call.argument("atUs");
+                    Number maxEdge = call.argument("maxEdge");
+                    if (path == null || atUs == null || maxEdge == null) {
+                        result.error("clipFrameAt",
+                                "path, atUs and maxEdge are all required", null);
+                        break;
+                    }
+                    if (mClipPreviews == null) {
+                        mClipPreviews = new ClipPreviewCache();
+                    }
+                    // Answered from the worker thread, so the platform thread is
+                    // free to keep drawing the handle that asked. `result` is not
+                    // thread-safe, hence the hop back.
+                    mClipPreviews.frameAt(path, atUs.longValue(), maxEdge.intValue(),
+                            image -> mMainHandler.post(() -> {
+                                if (image == null) {
+                                    result.success(null);
+                                    return;
+                                }
+                                Map<String, Object> frame = new java.util.LinkedHashMap<>();
+                                frame.put("rgba", image.rgba);
+                                frame.put("width", image.width);
+                                frame.put("height", image.height);
+                                result.success(frame);
+                            }));
+                    break;
+                }
+                case "releaseClipPreviews":
+                {
+                    releaseClipPreviews();
+                    result.success(null);
                     break;
                 }
                 case "finish":

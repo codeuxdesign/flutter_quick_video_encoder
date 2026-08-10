@@ -131,9 +131,28 @@ static void blendClipIntoFrame(uint8_t *dst, int frameWidth, int frameHeight,
 @property(nonatomic) AVAssetReaderTrackOutput *output;
 @property(nonatomic) CVPixelBufferRef current;
 @property(nonatomic) CMTime currentEnd;
+/// The instant the last `seekableFrameAtTime:` was asked for, or invalid.
+///
+/// **What "backwards" is measured against, and it is deliberately not the held
+/// frame's own start.** Sample durations do not always tile: measured on a
+/// 120 fps drone clip, `start + duration` lands 0.7 ms short of the next
+/// sample's timestamp, so the frame covering 30.000 s reports a start of
+/// 30.0007 s. Asking for 30.000 s again then looks like a scrub backwards and
+/// rebuilds the reader — 79 ms, measured, to answer with the frame it was
+/// already holding. The question a seek actually has to answer is whether the
+/// *caller* went back, which is this.
+@property(nonatomic) CMTime lastAnswered;
 /// How to read this clip's samples. Owned here, freed in `dealloc`.
 @property(nonatomic, assign) FQVEClipColor *color;
+/// The asset and its video track, kept so a seek can rebuild the reader without
+/// paying `FQVEFirstTrack`'s load again — which is most of what opening a clip
+/// costs. **The asset is retained explicitly**: `AVAssetTrack.asset` is a *weak*
+/// reference, so a track outliving the local that created its asset holds
+/// nothing, and the rebuild would find nil where a file used to be.
+@property(nonatomic) AVURLAsset *asset;
+@property(nonatomic) AVAssetTrack *track;
 - (instancetype)initWithPath:(NSString *)path reason:(NSString **)reason;
+- (CVPixelBufferRef)seekableFrameAtTime:(CMTime)time;
 @end
 
 /// What the track says its colour is, mapped onto the shared enums.
@@ -180,6 +199,19 @@ static FQVEClipColor *FQVEClipColorFromTrack(AVAssetTrack *track) {
     return color;
 }
 
+/// How far before a seek's target the rebuilt reader starts. See
+/// `startReadingFrom:reason:` for why it is not zero.
+static const int64_t kFQVEPreRollUs = 250000;
+
+/// How far ahead a scrub may ask before rebuilding beats decoding through.
+///
+/// The same two seconds, and the same reasoning, as the Android reader's
+/// `SEEK_AHEAD_US`: past this a rebuild is cheaper than the frames in between,
+/// and below it ordinary forward nudging of a trim handle never pays for one.
+/// Keeping the two platforms on one number is what lets a scrub feel the same on
+/// both, and lets a disagreement between them be a bug rather than a setting.
+static const int64_t kFQVESeekAheadUs = 2000000;
+
 @implementation FQVEClipReader
 
 - (instancetype)initWithPath:(NSString *)path {
@@ -198,25 +230,42 @@ static FQVEClipColor *FQVEClipColorFromTrack(AVAssetTrack *track) {
     self = [super init];
     if (!self) { return nil; }
 
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-    AVAssetTrack *track = FQVEFirstTrack(asset, AVMediaTypeVideo);
-    if (!track) {
+    self.asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    self.track = FQVEFirstTrack(self.asset, AVMediaTypeVideo);
+    if (!self.track) {
         if (reason) { *reason = @"no video track, or its tracks did not load"; }
         return nil;
     }
+    self.color = FQVEClipColorFromTrack(self.track);
 
+    if (![self startReadingFrom:kCMTimeZero reason:reason]) {
+        return nil;
+    }
+    return self;
+}
+
+/// Builds the reader and its output, reading from [time] onward.
+///
+/// **One place, called by the open and by every seek.** The output settings are
+/// the export's contract with `FQVEClipColor` — ten-bit YCbCr, no
+/// `AVVideoColorPropertiesKey`, nobody else's tone map — and a preview that
+/// rebuilt the reader with its own copy of them would be one edit away from
+/// showing a rider a frame the film will not draw. Written twice, they drift;
+/// written once, the preview cannot disagree with the export about color even in
+/// principle.
+- (BOOL)startReadingFrom:(CMTime)time reason:(NSString **)reason {
     NSError *error = nil;
     // **Named on `self`, not just captured locally.** A reader that outlives
     // only its output deallocates when the method returns, and
     // `copyNextSampleBuffer` then raises from the writer's own dispatch queue,
     // where no `@try` reaches it and the app dies rather than returning an
     // error. That exact bug has been paid for once in this file already.
-    self.reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
+    self.reader = [[AVAssetReader alloc] initWithAsset:self.asset error:&error];
     if (!self.reader) {
         if (reason) {
             *reason = error.localizedDescription ?: @"could not open a reader";
         }
-        return nil;
+        return NO;
     }
 
     // **Ten-bit YCbCr, and deliberately no `AVVideoColorPropertiesKey`.**
@@ -228,7 +277,7 @@ static FQVEClipColor *FQVEClipColorFromTrack(AVAssetTrack *track) {
     // published method. It is also the same shape Android receives, so the two
     // are comparable pixel for pixel rather than by eye.
     self.output = [[AVAssetReaderTrackOutput alloc]
-        initWithTrack:track
+        initWithTrack:self.track
        outputSettings:@{
            (id)kCVPixelBufferPixelFormatTypeKey :
                @(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
@@ -236,19 +285,45 @@ static FQVEClipColor *FQVEClipColorFromTrack(AVAssetTrack *track) {
     self.output.alwaysCopiesSampleData = NO;
     if (![self.reader canAddOutput:self.output]) {
         if (reason) { *reason = @"this device cannot decode it to 10-bit YCbCr"; }
-        return nil;
+        return NO;
     }
-    self.color = FQVEClipColorFromTrack(track);
     [self.reader addOutput:self.output];
+
+    // **Started a little before the wanted instant, not at it.** An
+    // `AVAssetReader` given a time range delivers the samples that fall inside
+    // it, and the frame a film shows at *t* is the one that *began* before *t*
+    // and is still on screen — so starting exactly at *t* hands back the next
+    // frame instead, which is the wrong picture by up to a frame and looks
+    // exactly like the right one. A quarter of a second is a handful of frames
+    // at any rate anyone shoots at, and the walk in `frameAtTime:` throws them
+    // away for a cost that does not show up next to the decode.
+    if (CMTIME_COMPARE_INLINE(time, >, kCMTimeZero)) {
+        CMTime from = CMTimeSubtract(time, CMTimeMake(kFQVEPreRollUs, 1000000));
+        if (CMTIME_COMPARE_INLINE(from, <, kCMTimeZero)) { from = kCMTimeZero; }
+        self.reader.timeRange = CMTimeRangeMake(from, kCMTimePositiveInfinity);
+    }
+
     if (![self.reader startReading]) {
         if (reason) {
             *reason = self.reader.error.localizedDescription ?: @"could not start reading";
         }
-        return nil;
+        return NO;
     }
 
+    // The held frame belongs to where the reader used to be. Keeping it would
+    // let a seek that decodes nothing answer with a picture from another
+    // instant — which is a plausible frame, and therefore the failure this
+    // whole feature would ship with unnoticed.
+    if (self.current) {
+        CVPixelBufferRelease(self.current);
+        self.current = NULL;
+    }
+    // Invalid rather than zero: nothing has been answered from this reader yet,
+    // and zero would read as "the caller last asked for the first instant",
+    // which makes every subsequent request look like a step forward.
+    self.lastAnswered = kCMTimeInvalid;
     self.currentEnd = kCMTimeZero;
-    return self;
+    return YES;
 }
 
 /// The frame covering [time], decoded forward from wherever the reader is.
@@ -276,10 +351,305 @@ static FQVEClipColor *FQVEClipColorFromTrack(AVAssetTrack *track) {
     return self.current;
 }
 
+/// As `frameAtTime:`, but able to go backwards and to jump.
+///
+/// **The export never calls this and the preview always does.** A film plays
+/// each clip forward exactly once, so `frameAtTime:`'s sequential walk is the
+/// right shape for it and rebuilding a reader mid-export would be pure loss. A
+/// trim handle is dragged in both directions and dropped anywhere in the file,
+/// where the same walk cannot go back at all and would decode a minute of 4K to
+/// go forward. So the seek lives here, on top of the same reader rather than
+/// beside it: the frame this returns is chosen by the identical forward walk,
+/// simply started closer to the answer.
+///
+/// The forward test is skipped once the reader has run out, mirroring the
+/// Android side — a handle held past the end of a clip would otherwise rebuild
+/// on every call, each one landing on the same last frame.
+- (CVPixelBufferRef)seekableFrameAtTime:(CMTime)time {
+    BOOL exhausted = self.reader.status == AVAssetReaderStatusCompleted;
+    BOOL behind = CMTIME_IS_VALID(self.lastAnswered)
+        && CMTIME_COMPARE_INLINE(time, <, self.lastAnswered);
+    BOOL farAhead = !exhausted
+        && CMTIME_COMPARE_INLINE(
+               time, >, CMTimeAdd(self.currentEnd,
+                                  CMTimeMake(kFQVESeekAheadUs, 1000000)));
+    if (behind || farAhead) {
+        NSString *reason = nil;
+        if (![self startReadingFrom:time reason:&reason]) {
+            NSLog(@"FQVE: CLIP could not seek to %lldus: %@",
+                  (long long)(CMTimeGetSeconds(time) * 1e6), reason);
+            return NULL;
+        }
+    }
+    CVPixelBufferRef frame = [self frameAtTime:time];
+    if (frame) {
+        self.lastAnswered = time;
+    }
+    return frame;
+}
+
 - (void)dealloc {
     if (self.current) { CVPixelBufferRelease(self.current); }
     [self.reader cancelReading];
     FQVEClipColorRelease(self.color);
+}
+
+@end
+
+/// One edge of a frame, scaled so that [longest] lands on [maxEdge].
+static int FQVEScaledEdge(int edge, int longest, int maxEdge) {
+    if (longest <= maxEdge) { return edge; }
+    // Rounded rather than truncated, so a 16:9 frame stays as close to 16:9 as
+    // integers allow — and floored at one, because a frame far wider than it is
+    // tall would otherwise scale its short edge to nothing and hand back an
+    // empty buffer with a plausible width. The Java `ClipPreview.scaled` is the
+    // same two lines; where they differ, they are wrong.
+    long scaled = llround((double)edge * maxEdge / longest);
+    return (int)MAX(1L, scaled);
+}
+
+/// [clip] as straight RGBA, downsampled so its longer side fits [maxEdge].
+///
+/// **This is `blendClipIntoFrame` into a cleared rectangle, and nothing else.**
+/// Same nearest-neighbor tap, same half-pixel offset, same `FQVEClipColorToRgb`,
+/// same ten bits in the high bits of each word. A preview exists to promise what
+/// the export will draw, so anything cheaper here — a different sampler, a
+/// different tone map, AVFoundation's own BGRA conversion — is a rider trimming
+/// against a picture the film will not show.
+///
+/// The rotation the container carries is deliberately *not* applied: the export
+/// turns the frame in the hole's `quarterTurns` rather than in the reader, so
+/// turning it here would mean the preview and the film disagree about which way
+/// up the footage is by exactly the metadata that was supposed to settle it.
+static NSData *FQVEClipPreviewRgba(CVPixelBufferRef clip,
+                                   const FQVEClipColor *color,
+                                   int maxEdge,
+                                   int *outWidth,
+                                   int *outHeight)
+{
+    if (!clip || !color || maxEdge <= 0) { return nil; }
+
+    CVPixelBufferLockBaseAddress(clip, kCVPixelBufferLock_ReadOnly);
+    const uint16_t *lumaPlane =
+        (const uint16_t *)CVPixelBufferGetBaseAddressOfPlane(clip, 0);
+    const uint16_t *chromaPlane =
+        (const uint16_t *)CVPixelBufferGetBaseAddressOfPlane(clip, 1);
+    size_t lumaStride = CVPixelBufferGetBytesPerRowOfPlane(clip, 0);
+    size_t chromaStride = CVPixelBufferGetBytesPerRowOfPlane(clip, 1);
+    int srcW = (int)CVPixelBufferGetWidth(clip);
+    int srcH = (int)CVPixelBufferGetHeight(clip);
+    if (!lumaPlane || !chromaPlane || srcW <= 0 || srcH <= 0) {
+        CVPixelBufferUnlockBaseAddress(clip, kCVPixelBufferLock_ReadOnly);
+        return nil;
+    }
+
+    int longest = MAX(srcW, srcH);
+    int outW = FQVEScaledEdge(srcW, longest, maxEdge);
+    int outH = FQVEScaledEdge(srcH, longest, maxEdge);
+
+    NSMutableData *out = [NSMutableData dataWithLength:(NSUInteger)outW * outH * 4];
+    uint8_t *dst = (uint8_t *)out.mutableBytes;
+
+    for (int y = 0; y < outH; y++) {
+        float v = (y + 0.5f) / outH;
+        int sy = (int)(v * srcH);
+        if (sy < 0) { sy = 0; } else if (sy >= srcH) { sy = srcH - 1; }
+
+        const uint16_t *lumaRow =
+            (const uint16_t *)((const uint8_t *)lumaPlane + (size_t)sy * lumaStride);
+        const uint16_t *chromaRow =
+            (const uint16_t *)((const uint8_t *)chromaPlane
+                               + (size_t)(sy / 2) * chromaStride);
+
+        for (int x = 0; x < outW; x++) {
+            float u = (x + 0.5f) / outW;
+            int sx = (int)(u * srcW);
+            if (sx < 0) { sx = 0; } else if (sx >= srcW) { sx = srcW - 1; }
+
+            const int yy = lumaRow[sx] >> 6;
+            const int cb = chromaRow[(sx / 2) * 2] >> 6;
+            const int cr = chromaRow[(sx / 2) * 2 + 1] >> 6;
+            const uint32_t rgb = FQVEClipColorToRgb(color, yy, cb, cr);
+
+            uint8_t *d = dst + ((size_t)y * outW + x) * 4;
+            d[0] = (uint8_t)((rgb >> 16) & 0xFF);
+            d[1] = (uint8_t)((rgb >> 8) & 0xFF);
+            d[2] = (uint8_t)(rgb & 0xFF);
+            d[3] = 255;
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(clip, kCVPixelBufferLock_ReadOnly);
+    if (outWidth) { *outWidth = outW; }
+    if (outHeight) { *outHeight = outH; }
+    return out;
+}
+
+@interface FQVEClipPreviewEntry : NSObject
+@property(nonatomic) FQVEClipReader *reader;
+@property(nonatomic) NSTimeInterval lastUsed;
+@end
+
+@implementation FQVEClipPreviewEntry
+@end
+
+/// Decoders held open so a trim handle can be dragged.
+///
+/// The plugin's `mClipReaders` is the same idea for the export and this is
+/// deliberately not that dictionary. The two read the same files in opposite
+/// patterns — a film walks each clip forward exactly once, a rider scrubs one
+/// clip back and forth — so a shared cache would leave the export's reader
+/// parked wherever the last scrub stopped, and the next frame of the film would
+/// pay for a rebuild nothing asked for.
+///
+/// **Every reader is touched from one serial queue and only from there.** A cold
+/// open of a 4K HEVC clip is a couple of hundred milliseconds and the platform
+/// thread is the thread the handle is drawn on, so decoding there makes the
+/// gesture being previewed stutter. A serial queue rather than a concurrent one,
+/// because it also serializes access to the readers for free: there are no locks
+/// in here and there is nothing to get wrong.
+@interface FQVEClipPreviews : NSObject
+- (void)frameAtPath:(NSString *)path
+             timeUs:(int64_t)timeUs
+            maxEdge:(int)maxEdge
+         completion:(void (^)(NSData *rgba, int width, int height))completion;
+/// Closes every reader, and does not return until they are closed.
+- (void)releaseReaders;
+@end
+
+@implementation FQVEClipPreviews {
+    dispatch_queue_t _queue;
+    NSMutableDictionary<NSString *, FQVEClipPreviewEntry *> *_readers;
+}
+
+/// How many decoders may be open at once.
+///
+/// The export's cache on this platform is unbounded, on the grounds that
+/// AVFoundation readers are cheap. A preview's are not cheap in the same way: a
+/// screen can sit open for minutes holding hardware an export is about to want,
+/// where an export's readers go away with the film. Two, matching the Android
+/// side, so that flicking between two clips does not reopen either.
+static const NSUInteger kFQVEMaxPreviewReaders = 2;
+
+/// How long a reader may sit unused before it gives its decode session back.
+///
+/// A backstop rather than the mechanism — `releaseClipPreviews` is what the
+/// screen is supposed to call. This is what covers the screen that forgot, and
+/// the rider who put the phone down mid-drag.
+static const NSTimeInterval kFQVEPreviewIdleSeconds = 20.0;
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _queue = dispatch_queue_create("fqve.clip.preview", DISPATCH_QUEUE_SERIAL);
+        _readers = [NSMutableDictionary dictionary];
+    }
+    return self;
+}
+
+- (void)frameAtPath:(NSString *)path
+             timeUs:(int64_t)timeUs
+            maxEdge:(int)maxEdge
+         completion:(void (^)(NSData *, int, int))completion
+{
+    dispatch_async(_queue, ^{
+        NSData *rgba = nil;
+        int width = 0;
+        int height = 0;
+
+        FQVEClipReader *reader = [self readerFor:path];
+        if (reader) {
+            CVPixelBufferRef frame =
+                [reader seekableFrameAtTime:CMTimeMake(timeUs, 1000000)];
+            rgba = FQVEClipPreviewRgba(frame, reader.color, maxEdge, &width, &height);
+            if (!rgba) {
+                // The reader is dropped rather than kept. A decode that produced
+                // nothing leaves it at an instant nobody can name, and reusing it
+                // would answer the next scrub with a frame from wherever it
+                // stopped — which looks like a picture rather than like an error.
+                [self forget:path];
+            }
+        }
+
+        completion(rgba, width, height);
+        [self sweepLater];
+    });
+}
+
+- (void)releaseReaders {
+    // Blocking is the point. The two callers are the screen going away and an
+    // export setting up, and an export that begins while a decode session is
+    // still being handed back is the failure this exists to prevent.
+    dispatch_sync(_queue, ^{
+        [self->_readers removeAllObjects];
+    });
+}
+
+// ---- preview queue only ----------------------------------------------------
+
+- (FQVEClipReader *)readerFor:(NSString *)path {
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    FQVEClipPreviewEntry *existing = _readers[path];
+    if (existing) {
+        existing.lastUsed = now;
+        return existing.reader;
+    }
+    while (_readers.count >= kFQVEMaxPreviewReaders) {
+        [self evictOldest];
+    }
+    NSString *reason = nil;
+    FQVEClipReader *opened = [[FQVEClipReader alloc] initWithPath:path reason:&reason];
+    if (!opened) {
+        NSLog(@"FQVE: CLIP preview cannot open %@: %@", path,
+              reason ?: @"could not be opened");
+        return nil;
+    }
+    FQVEClipPreviewEntry *entry = [[FQVEClipPreviewEntry alloc] init];
+    entry.reader = opened;
+    entry.lastUsed = now;
+    _readers[path] = entry;
+    return opened;
+}
+
+- (void)forget:(NSString *)path {
+    [_readers removeObjectForKey:path];
+}
+
+/// Asks the queue to look again once the idle window has passed.
+///
+/// Scheduled rather than checked on the next call, because there may not be a
+/// next call — a rider who stops scrubbing and puts the phone down is exactly
+/// the case where a session would otherwise be held indefinitely, and it is also
+/// the case nobody notices until some other clip will not open.
+- (void)sweepLater {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)((kFQVEPreviewIdleSeconds + 0.5) * NSEC_PER_SEC)),
+                   _queue, ^{ [self sweep]; });
+}
+
+- (void)sweep {
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    for (NSString *path in [_readers allKeys]) {
+        if (now - _readers[path].lastUsed >= kFQVEPreviewIdleSeconds) {
+            NSLog(@"FQVE: CLIP preview evict idle %@", path);
+            [_readers removeObjectForKey:path];
+        }
+    }
+}
+
+- (void)evictOldest {
+    NSString *oldestKey = nil;
+    NSTimeInterval oldest = INFINITY;
+    for (NSString *path in _readers) {
+        if (_readers[path].lastUsed < oldest) {
+            oldest = _readers[path].lastUsed;
+            oldestKey = path;
+        }
+    }
+    if (!oldestKey) { return; }
+    NSLog(@"FQVE: CLIP preview evict oldest %@ to stay under %lu readers",
+          oldestKey, (unsigned long)kFQVEMaxPreviewReaders);
+    [_readers removeObjectForKey:oldestKey];
 }
 
 @end
@@ -314,6 +684,12 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 /// Seeking per frame would re-open a decode session for each of them, which on
 /// a 4K HEVC file is the difference between three milliseconds and forty.
 @property(nonatomic) NSMutableDictionary<NSString *, FQVEClipReader *> *mClipReaders;
+
+/// Decoders held open for a trim handle, or nil until one is asked for.
+///
+/// Separate from `mClipReaders` on purpose, and released whenever an export sets
+/// up, so a screen that forgot to let go cannot starve the film of a decoder.
+@property(nonatomic) FQVEClipPreviews *mClipPreviews;
 
 /// The last thermal level reported, so only transitions are logged. Starts nil,
 /// which no level equals, so the first frame always states where it began.
@@ -449,6 +825,50 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             }
             result(failures);
         }
+        else if ([@"clipFrameAt" isEqualToString:call.method])
+        {
+            // One decode per scrub position, through the reader the export uses.
+            // A general-purpose player would be easier and is the wrong answer:
+            // the rider is choosing a trim against this picture, so it has to be
+            // the picture the film will show, down to the color conversion.
+            NSDictionary *args = (NSDictionary *)call.arguments;
+            NSString *path = args[@"path"];
+            NSNumber *atUs = args[@"atUs"];
+            NSNumber *maxEdge = args[@"maxEdge"];
+            if (![path isKindOfClass:[NSString class]] || !atUs || !maxEdge) {
+                result([FlutterError errorWithCode:@"clipFrameAt"
+                                           message:@"path, atUs and maxEdge are all required"
+                                           details:nil]);
+                return;
+            }
+            if (!self.mClipPreviews) {
+                self.mClipPreviews = [[FQVEClipPreviews alloc] init];
+            }
+            // Answered from the preview queue, so the platform thread is free to
+            // keep drawing the handle that asked. A `FlutterResult` belongs to
+            // the platform thread, hence the hop back.
+            [self.mClipPreviews frameAtPath:path
+                                     timeUs:atUs.longLongValue
+                                    maxEdge:maxEdge.intValue
+                                 completion:^(NSData *rgba, int width, int height) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (!rgba) {
+                        result(nil);
+                        return;
+                    }
+                    result(@{
+                        @"rgba" : [FlutterStandardTypedData typedDataWithBytes:rgba],
+                        @"width" : @(width),
+                        @"height" : @(height),
+                    });
+                });
+            }];
+        }
+        else if ([@"releaseClipPreviews" isEqualToString:call.method])
+        {
+            [self.mClipPreviews releaseReaders];
+            result(nil);
+        }
         else if ([@"setLogLevel" isEqualToString:call.method])
         {
             NSDictionary *args = (NSDictionary*)call.arguments;
@@ -460,6 +880,14 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         }
         else if ([@"setup" isEqualToString:call.method])
         {
+            // Let the preview decoders go before the film asks for any. A device
+            // has a finite supply of concurrent decode sessions, so a Clips
+            // screen still holding one is a clip this export may not be able to
+            // open — and that surfaces as an unrelated file failing, which is the
+            // wrong diagnosis every time. Cheap: nothing is scrubbing during an
+            // export, so nothing reopens.
+            [self.mClipPreviews releaseReaders];
+
             NSDictionary *args = (NSDictionary*)call.arguments;
 
             // Extract parameters from 'args'
