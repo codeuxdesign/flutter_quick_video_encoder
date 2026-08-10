@@ -133,12 +133,30 @@ final class ClipColor {
      */
     final boolean wideGamutOrHdr;
 
+    /**
+     * How many input codes the tables cover.
+     *
+     * <p><b>Ten bits on both platforms, and an 8-bit source is shifted up.</b>
+     * Apple hands back `420YpCbCr10BiPlanarVideoRange` and Android
+     * `YCBCR_P010`, so ten is the wider of the two and the one that loses
+     * nothing. The shift is exact at both ends of limited range — 16 becomes 64
+     * and 235 becomes 940 — so an 8-bit clip converts identically to before.
+     */
+    static final int CODES = 1024;
+
+    /** 10-bit limited range: luma 64..940, chroma centred on 512 with 896 of swing. */
+    private static final double CODE_MAX = 1023.0;
+    private static final double LIMITED_LUMA_OFFSET = 64.0;
+    private static final double LIMITED_LUMA_SPAN = 876.0;
+    private static final double CHROMA_CENTRE = 512.0;
+    private static final double LIMITED_CHROMA_SPAN = 896.0;
+
     // Integer path, 16.16 fixed point, one table per input code.
-    private final int[] yTerm = new int[256];
-    private final int[] rFromV = new int[256];
-    private final int[] gFromV = new int[256];
-    private final int[] gFromU = new int[256];
-    private final int[] bFromU = new int[256];
+    private final int[] yTerm = new int[CODES];
+    private final int[] rFromV = new int[CODES];
+    private final int[] gFromV = new int[CODES];
+    private final int[] gFromU = new int[CODES];
+    private final int[] bFromU = new int[CODES];
 
     // Float path. Signal space first, then linear light, then sRGB.
     private float[] wY;
@@ -191,18 +209,18 @@ final class ClipColor {
         // chroma on 128 with 224 codes of swing. Full range uses all 256. Get
         // this wrong and the picture is merely low contrast, which reads as a
         // bad clip rather than as a bug.
-        final double yScale = fullRange ? 1.0 / 255.0 : 1.0 / 219.0;
-        final double yOffset = fullRange ? 0.0 : 16.0;
-        final double cScale = fullRange ? 1.0 / 255.0 : 1.0 / 224.0;
+        final double yScale = fullRange ? 1.0 / CODE_MAX : 1.0 / LIMITED_LUMA_SPAN;
+        final double yOffset = fullRange ? 0.0 : LIMITED_LUMA_OFFSET;
+        final double cScale = fullRange ? 1.0 / CODE_MAX : 1.0 / LIMITED_CHROMA_SPAN;
 
         final double rv = 2.0 * (1.0 - kr);
         final double bu = 2.0 * (1.0 - kb);
         final double gv = -2.0 * (1.0 - kr) * kr / kg;
         final double gu = -2.0 * (1.0 - kb) * kb / kg;
 
-        for (int i = 0; i < 256; i++) {
+        for (int i = 0; i < CODES; i++) {
             final double y = (i - yOffset) * yScale;
-            final double c = (i - 128) * cScale;
+            final double c = (i - CHROMA_CENTRE) * cScale;
             yTerm[i] = (int) Math.round(y * 255.0 * 65536.0);
             rFromV[i] = (int) Math.round(c * rv * 255.0 * 65536.0);
             bFromU[i] = (int) Math.round(c * bu * 255.0 * 65536.0);
@@ -222,14 +240,14 @@ final class ClipColor {
         lumaG = (float) kg;
         lumaB = (float) kb;
 
-        wY = new float[256];
-        wRfromV = new float[256];
-        wGfromV = new float[256];
-        wGfromU = new float[256];
-        wBfromU = new float[256];
-        for (int i = 0; i < 256; i++) {
+        wY = new float[CODES];
+        wRfromV = new float[CODES];
+        wGfromV = new float[CODES];
+        wGfromU = new float[CODES];
+        wBfromU = new float[CODES];
+        for (int i = 0; i < CODES; i++) {
             final double y = (i - yOffset) * yScale;
-            final double c = (i - 128) * cScale;
+            final double c = (i - CHROMA_CENTRE) * cScale;
             wY[i] = (float) y;
             wRfromV[i] = (float) (c * rv);
             wBfromU[i] = (float) (c * bu);

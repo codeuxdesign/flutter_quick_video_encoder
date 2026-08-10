@@ -41,12 +41,20 @@ public class ClipColorRealFrameTest {
         assertTrue("unexpected raw size " + all.length,
                 all.length >= lumaSize + 2 * chromaSize);
 
-        final byte[] luma = new byte[lumaSize];
-        final byte[] cb = new byte[chromaSize];
-        final byte[] cr = new byte[chromaSize];
-        System.arraycopy(all, 0, luma, 0, lumaSize);
-        System.arraycopy(all, lumaSize, cb, 0, chromaSize);
-        System.arraycopy(all, lumaSize + chromaSize, cr, 0, chromaSize);
+        // The raw frame is 8-bit; the pipeline is ten. Shifting by two is exact
+        // at both ends of limited range, so this compares the arithmetic rather
+        // than a rescaling artefact — the same shift the Objective-C harness
+        // applies, which is what makes the two outputs comparable byte for byte.
+        final short[] luma = new short[lumaSize];
+        final short[] cb = new short[chromaSize];
+        final short[] cr = new short[chromaSize];
+        for (int i = 0; i < lumaSize; i++) {
+            luma[i] = (short) ((all[i] & 0xFF) << 2);
+        }
+        for (int i = 0; i < chromaSize; i++) {
+            cb[i] = (short) ((all[lumaSize + i] & 0xFF) << 2);
+            cr[i] = (short) ((all[lumaSize + chromaSize + i] & 0xFF) << 2);
+        }
 
         writeWith(luma, cb, cr,
                 new ClipColor(ClipColor.STANDARD_BT2020, ClipColor.TRANSFER_HLG, false),
@@ -62,7 +70,7 @@ public class ClipColorRealFrameTest {
     }
 
     /** Binary PPM, because the Android unit-test classpath has no ImageIO. */
-    private static void writeWith(byte[] luma, byte[] cb, byte[] cr,
+    private static void writeWith(short[] luma, short[] cb, short[] cr,
                                   ClipColor color, File out) throws Exception {
         final ClipFrame frame = new ClipFrame(luma, cb, cr, W, H, color, 0L, false);
         try (OutputStream os = new FileOutputStream(out)) {

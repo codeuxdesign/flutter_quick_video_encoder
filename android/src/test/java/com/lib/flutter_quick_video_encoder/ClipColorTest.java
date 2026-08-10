@@ -30,17 +30,29 @@ public class ClipColorTest {
     }
 
     /** The luma code carrying [signal] of the range, 0..1. */
+    /**
+     * A 0..1 signal as a 10-bit limited-range code.
+     *
+     * <p>Ten bits because both platforms now feed ten: Apple's
+     * `420YpCbCr10BiPlanarVideoRange` and Android's `YCBCR_P010`. Limited range
+     * puts black at 64 and white at 940, which is exactly the 8-bit 16 and 235
+     * shifted up by two — so every expectation in this file that was written
+     * against 8-bit codes still means the same thing.
+     */
     private static int limitedCode(double signal) {
-        return (int) Math.round(16.0 + signal * 219.0);
+        return (int) Math.round(64.0 + signal * 876.0);
     }
+
+    /** Neutral chroma, ten-bit. */
+    private static final int NEUTRAL = 512;
 
     @Test
     public void limitedRangeMapsSixteenToBlackAndTwoThirtyFiveToWhite() {
         final ClipColor color =
                 new ClipColor(ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, false);
 
-        assertEquals(0x000000, color.toRgb(16, 128, 128));
-        assertEquals(0xFFFFFF, color.toRgb(235, 128, 128));
+        assertEquals(0x000000, color.toRgb(64, NEUTRAL, NEUTRAL));
+        assertEquals(0xFFFFFF, color.toRgb(940, NEUTRAL, NEUTRAL));
     }
 
     @Test
@@ -48,8 +60,8 @@ public class ClipColorTest {
         final ClipColor color =
                 new ClipColor(ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, true);
 
-        assertEquals(0x000000, color.toRgb(0, 128, 128));
-        assertEquals(0xFFFFFF, color.toRgb(255, 128, 128));
+        assertEquals(0x000000, color.toRgb(0, NEUTRAL, NEUTRAL));
+        assertEquals(0xFFFFFF, color.toRgb(1023, NEUTRAL, NEUTRAL));
     }
 
     /**
@@ -62,7 +74,12 @@ public class ClipColorTest {
         final ClipColor asFull =
                 new ClipColor(ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, true);
 
-        assertEquals(16, red(asFull.toRgb(16, 128, 128)));
+        // Fifteen, not the 8-bit test's sixteen. Limited-range black is code 64,
+        // and read as full range that is 64/1023 of the scale — a hair under the
+        // old 16/255 (64*255 = 16320 against 16*1023 = 16368) — so the flooring
+        // decode lands one below. The point is unchanged: a visibly dark gray
+        // where black was meant.
+        assertEquals(15, red(asFull.toRgb(64, NEUTRAL, NEUTRAL)));
     }
 
     @Test
@@ -73,12 +90,12 @@ public class ClipColorTest {
                 new ClipColor(ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, false);
 
         // A strongly colored sample, so the coefficients actually differ.
-        final int a = bt601.toRgb(128, 90, 200);
-        final int b = bt709.toRgb(128, 90, 200);
+        final int a = bt601.toRgb(512, 360, 800);
+        final int b = bt709.toRgb(512, 360, 800);
 
         assertTrue("601 and 709 must not agree on a saturated color", a != b);
         // Neutral is neutral under either, which is what keeps a grey card grey.
-        assertEquals(bt601.toRgb(126, 128, 128), bt709.toRgb(126, 128, 128));
+        assertEquals(bt601.toRgb(126, NEUTRAL, NEUTRAL), bt709.toRgb(126, NEUTRAL, NEUTRAL));
     }
 
     /**
@@ -91,8 +108,8 @@ public class ClipColorTest {
         final ClipColor color =
                 new ClipColor(ClipColor.STANDARD_BT2020, ClipColor.TRANSFER_SDR, false);
 
-        assertEquals(0xFFFFFF, color.toRgb(235, 128, 128));
-        assertEquals(0x000000, color.toRgb(16, 128, 128));
+        assertEquals(0xFFFFFF, color.toRgb(940, NEUTRAL, NEUTRAL));
+        assertEquals(0x000000, color.toRgb(64, NEUTRAL, NEUTRAL));
     }
 
     @Test
@@ -103,7 +120,7 @@ public class ClipColorTest {
         // Within one code: the matrix is applied in single precision and the
         // sRGB table is 4096 entries deep, so an exact match would be asserting
         // on rounding rather than on neutrality.
-        final int grey = color.toRgb(limitedCode(0.5), 128, 128);
+        final int grey = color.toRgb(limitedCode(0.5), NEUTRAL, NEUTRAL);
         assertTrue("red " + red(grey) + " and green " + green(grey),
                 Math.abs(red(grey) - green(grey)) <= 1);
         assertTrue("green " + green(grey) + " and blue " + blue(grey),
@@ -145,7 +162,7 @@ public class ClipColorTest {
         final double display = Math.pow(scene, 1.2);
 
         final int expected = methodAneutral(display);
-        final int converted = red(hlg.toRgb(limitedCode(0.75), 128, 128));
+        final int converted = red(hlg.toRgb(limitedCode(0.75), NEUTRAL, NEUTRAL));
 
         assertTrue("HLG diffuse white came out at " + converted + ", but Report ITU-R "
                         + "BT.2446-1 Method A puts it at " + expected,
@@ -153,7 +170,7 @@ public class ClipColorTest {
 
         // Still has to be a long way from ignoring the transfer, or the test
         // would pass with the HLG handling deleted.
-        final int ignored = red(sdr.toRgb(limitedCode(0.75), 128, 128));
+        final int ignored = red(sdr.toRgb(limitedCode(0.75), NEUTRAL, NEUTRAL));
         assertTrue("treating HLG as SDR gave " + ignored + ", too close to " + converted,
                 Math.abs(converted - ignored) >= 20);
     }
@@ -184,7 +201,7 @@ public class ClipColorTest {
                     ? signal * signal / 3.0
                     : (Math.exp((signal - c) / a) + b) / 12.0;
             final int expected = methodAneutral(Math.pow(scene, 1.2));
-            final int actual = red(hlg.toRgb(limitedCode(signal), 128, 128));
+            final int actual = red(hlg.toRgb(limitedCode(signal), NEUTRAL, NEUTRAL));
             assertTrue("signal " + signal + " converted to " + actual
                             + ", but Method A puts it at " + expected,
                     Math.abs(actual - expected) <= 2);
@@ -246,7 +263,7 @@ public class ClipColorTest {
         final double[] signals = {0.75, 0.85, 0.93, 1.0};
         final int[] out = new int[signals.length];
         for (int i = 0; i < signals.length; i++) {
-            out[i] = red(hlg.toRgb(limitedCode(signals[i]), 128, 128));
+            out[i] = red(hlg.toRgb(limitedCode(signals[i]), NEUTRAL, NEUTRAL));
         }
 
         for (int i = 1; i < out.length; i++) {
@@ -267,7 +284,7 @@ public class ClipColorTest {
         final ClipColor hlg =
                 new ClipColor(ClipColor.STANDARD_BT2020, ClipColor.TRANSFER_HLG, false);
 
-        assertEquals(0x000000, hlg.toRgb(16, 128, 128));
+        assertEquals(0x000000, hlg.toRgb(64, NEUTRAL, NEUTRAL));
     }
 
     @Test
@@ -276,8 +293,9 @@ public class ClipColorTest {
                 new ClipColor(ClipColor.STANDARD_BT2020, ClipColor.TRANSFER_HLG, false);
 
         int previous = -1;
-        for (int code = 16; code <= 235; code++) {
-            final int value = red(hlg.toRgb(code, 128, 128));
+        // The whole of 10-bit limited range, black to white.
+        for (int code = 64; code <= 940; code++) {
+            final int value = red(hlg.toRgb(code, NEUTRAL, NEUTRAL));
             assertTrue("code " + code + " went backwards: " + value + " after " + previous,
                     value >= previous);
             previous = value;
@@ -311,7 +329,7 @@ public class ClipColorTest {
 
         // 203 cd/m2 against the 1 000 cd/m2 peak BT.2446 assumes.
         final int expected = methodAneutral(203.0 / 1000.0);
-        final int converted = red(pq.toRgb(limitedCode(signal), 128, 128));
+        final int converted = red(pq.toRgb(limitedCode(signal), NEUTRAL, NEUTRAL));
         assertTrue("PQ reference white came out at " + converted + ", but Method A puts "
                         + "it at " + expected, Math.abs(converted - expected) <= 2);
     }

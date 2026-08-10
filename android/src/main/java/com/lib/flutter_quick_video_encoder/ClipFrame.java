@@ -26,9 +26,24 @@ package com.lib.flutter_quick_video_encoder;
  */
 final class ClipFrame {
 
-    final byte[] luma;
-    final byte[] cb;
-    final byte[] cr;
+    /**
+     * Ten-bit samples, one per array slot.
+     *
+     * <p><b>`short` rather than `byte`, which doubles the frame and is the
+     * point.</b> A 4K frame goes from about 12 MB to 25 MB. What it buys is that
+     * the tone map's curve is evaluated on ten bits and quantised once
+     * afterwards, instead of quantising to eight first and then bending a steep
+     * curve through the result — which is where a smooth sky bands. Nothing
+     * downstream widens: `rgbAt` still returns packed 8-bit RGB and `ClipBlend`
+     * is untouched.
+     *
+     * <p>Signed, because Java has no unsigned short; every read masks with
+     * `0x3FF`, which is also what keeps an 8-bit source shifted up by two
+     * indistinguishable from a native ten-bit one.
+     */
+    final short[] luma;
+    final short[] cb;
+    final short[] cr;
     final int width;
     final int height;
     final int chromaWidth;
@@ -51,7 +66,7 @@ final class ClipFrame {
      */
     final boolean tenBit;
 
-    ClipFrame(byte[] luma, byte[] cb, byte[] cr, int width, int height,
+    ClipFrame(short[] luma, short[] cb, short[] cr, int width, int height,
               ClipColor color, long presentationTimeUs, boolean tenBit) {
         this.luma = luma;
         this.cb = cb;
@@ -75,8 +90,8 @@ final class ClipFrame {
      * past would pay for a conversion nobody looks at.
      */
     int rgbAt(int sx, int sy) {
-        final int y = luma[sy * width + sx] & 0xFF;
+        final int y = luma[sy * width + sx] & 0x3FF;
         final int ci = (sy >> 1) * chromaWidth + (sx >> 1);
-        return color.toRgb(y, cb[ci] & 0xFF, cr[ci] & 0xFF);
+        return color.toRgb(y, cb[ci] & 0x3FF, cr[ci] & 0x3FF);
     }
 }

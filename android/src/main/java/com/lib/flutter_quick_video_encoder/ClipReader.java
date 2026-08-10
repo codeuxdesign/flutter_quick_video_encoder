@@ -82,8 +82,8 @@ final class ClipReader {
     /** The first decoded frame past that instant, kept so it is not decoded twice. */
     private ClipFrame ahead;
 
-    private byte[][] slotA;
-    private byte[][] slotB;
+    private short[][] slotA;
+    private short[][] slotB;
     private int slotWidth;
     private int slotHeight;
 
@@ -233,12 +233,82 @@ final class ClipReader {
         // of them is wrong on half the phones in the world with no error
         // anywhere. Flexible plus the Image's own row and pixel strides is the
         // only portable read.
+        //
+        // **Except for ten-bit sources, which have to ask by name.** Flexible is
+        // satisfied by 8-bit: a Galaxy S24 Ultra answers a Main10 stream with
+        // `YUV_420_888`, having truncated on the way, and the frame then decodes
+        // and converts perfectly well two bits short. Nothing about that is
+        // visible in the output — which is why `ClipTenBitTest` asserts the
+        // format the decoder returned rather than the colours it produced.
+        // `COLOR_FormatYUVP010` is only requested where the decoder advertises
+        // it, so a device without it keeps the portable path instead of failing
+        // to configure.
+        final boolean wantTenBit = isTenBitSource() && decoderOffersP010();
         configure.setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
+                wantTenBit
+                        ? COLOR_FormatYUVP010
+                        : MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
+        if (wantTenBit) {
+            Log.i(TAG, "CLIP requesting P010 for " + path);
+        }
 
         codec = MediaCodec.createByCodecName(decoderName);
         codec.configure(configure, null, null, 0);
         codec.start();
+    }
+
+    /**
+     * `MediaCodecInfo.CodecCapabilities.COLOR_FormatYUVP010`, by value.
+     *
+     * <p>Named as a constant because the symbol arrived in API 29 and this
+     * module still compiles against older platform stubs in places. The value is
+     * stable; a symbolic reference that fails to resolve at build time would be
+     * worse than a documented literal.
+     */
+    private static final int COLOR_FormatYUVP010 = 54;
+
+    /** Whether the track claims more than eight bits per sample. */
+    private boolean isTenBitSource() {
+        // Main10 and its HDR profiles. A file can also say so through its
+        // transfer function, which is the more reliable signal in practice
+        // because profile keys are not always present on the track format.
+        if (color != null && color.transfer != ClipColor.TRANSFER_SDR) {
+            return true;
+        }
+        if (trackFormat.containsKey(MediaFormat.KEY_PROFILE)) {
+            final int profile = trackFormat.getInteger(MediaFormat.KEY_PROFILE);
+            return profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
+                    || profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10
+                    || profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10Plus;
+        }
+        return false;
+    }
+
+    /**
+     * Whether the chosen decoder will actually hand back P010 for this mime.
+     *
+     * <p>Asked of the codec *list* rather than by instantiating the codec.
+     * Creating one to read its capabilities and dropping the reference leaks a
+     * decoder per clip, and a leaked decoder is a resource the next clip cannot
+     * have — on a phone that surfaces as an unrelated clip failing to open.
+     */
+    private boolean decoderOffersP010() {
+        try {
+            final MediaCodecList list = new MediaCodecList(MediaCodecList.ALL_CODECS);
+            for (final MediaCodecInfo info : list.getCodecInfos()) {
+                if (info.isEncoder() || !info.getName().equals(decoderName)) {
+                    continue;
+                }
+                for (final int format : info.getCapabilitiesForType(mime).colorFormats) {
+                    if (format == COLOR_FormatYUVP010) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "CLIP could not read colour formats for " + decoderName + ": " + e);
+        }
+        return false;
     }
 
     private void releaseDecoder() {
@@ -371,16 +441,19 @@ final class ClipReader {
 
         final int chromaWidth = width / 2;
         final int chromaHeight = height / 2;
-        final byte[][] slot = slotFor(width, height, chromaWidth, chromaHeight);
+        final short[][] slot = slotFor(width, height, chromaWidth, chromaHeight);
 
         final Image.Plane[] planes = image.getPlanes();
         logLayoutOnce(image, planes, format, left, top, width, height);
+        // The file's own range decides how an 8-bit sample widens, so it has to
+        // travel with the copy rather than be assumed by it.
+        final boolean fullRange = color != null && color.fullRange;
         copyPlane(planes[0].getBuffer(), planes[0].getRowStride(), planes[0].getPixelStride(),
-                slot[0], left, top, width, height, tenBit);
+                slot[0], left, top, width, height, tenBit, fullRange);
         copyPlane(planes[1].getBuffer(), planes[1].getRowStride(), planes[1].getPixelStride(),
-                slot[1], left / 2, top / 2, chromaWidth, chromaHeight, tenBit);
+                slot[1], left / 2, top / 2, chromaWidth, chromaHeight, tenBit, fullRange);
         copyPlane(planes[2].getBuffer(), planes[2].getRowStride(), planes[2].getPixelStride(),
-                slot[2], left / 2, top / 2, chromaWidth, chromaHeight, tenBit);
+                slot[2], left / 2, top / 2, chromaWidth, chromaHeight, tenBit, fullRange);
 
         return new ClipFrame(slot[0], slot[1], slot[2], width, height, color,
                 presentationTimeUs, tenBit);
@@ -426,19 +499,44 @@ final class ClipReader {
      * Given the numbers instead of the plane, a plain JVM test can lay out a
      * semiplanar, padded or 10-bit buffer by hand and check what comes out.
      */
-    static void copyPlane(ByteBuffer buffer, int rowStride, int pixelStride, byte[] out,
-                          int left, int top, int width, int height,
-                          boolean tenBit) {
-        final int sampleOffset = tenBit ? 1 : 0;
+    /**
+     * How an 8-bit code becomes its 10-bit equivalent.
+     *
+     * <p><b>The two ranges widen differently, and using one rule for both costs
+     * a code everywhere.</b> Limited range is an exact shift: 16 lands on 64 and
+     * 235 on 940, because both scales put black and white at the same fractions.
+     * Full range is not — 255 has to reach 1023, and shifting leaves it at 1020,
+     * so every non-zero sample decodes one low and white comes back 254. That is
+     * a uniform darkening of the whole clip with nothing logged, and the corpus
+     * has full-range files in it: the action-cam `yuvj420p` clips are exactly
+     * this case.
+     *
+     * <p>The full-range form is a ceiling rather than a round, because
+     * {@link ClipColor}'s integer path floors on the way back to 8 bits. The
+     * widened code has to sit at or above the exact {@code v * 1023 / 255} to
+     * survive that floor; rounding puts half the values a fraction below it.
+     * The bias is under half a code in 1023 and buys an exact round trip for all
+     * 256 inputs, which is what a clip that was 8-bit all along deserves.
+     */
+    private static short widen(int eightBit, boolean fullRange) {
+        return (short) (fullRange ? (eightBit * 1023 + 254) / 255 : eightBit << 2);
+    }
 
+    static void copyPlane(ByteBuffer buffer, int rowStride, int pixelStride, short[] out,
+                          int left, int top, int width, int height,
+                          boolean tenBit, boolean fullRange) {
         if (!tenBit && pixelStride == 1) {
-            // The common planar case: one bulk copy per row, straight into the
-            // packed array. A direct ByteBuffer's bulk get is a native memcpy;
-            // the per-sample loop below is not, which is why it is worth
-            // separating the two.
+            // The common planar 8-bit case. One bulk copy per row into a scratch
+            // byte array — a direct ByteBuffer's bulk get is a native memcpy and
+            // the per-sample loop below is not — then widened on the way out.
+            final byte[] row = new byte[width];
             for (int y = 0; y < height; y++) {
                 buffer.position((top + y) * rowStride + left);
-                buffer.get(out, y * width, width);
+                buffer.get(row, 0, width);
+                final int dst = y * width;
+                for (int x = 0; x < width; x++) {
+                    out[dst + x] = widen(row[x] & 0xFF, fullRange);
+                }
             }
             return;
         }
@@ -450,27 +548,36 @@ final class ClipReader {
         // that the JIT will not turn into one. This is the path a real phone
         // takes — the Galaxy S24 Ultra reports a chroma pixel stride of 2 — so
         // it is worth the scratch row.
-        final int span = (width - 1) * pixelStride + 1 + sampleOffset;
+        final int span = (width - 1) * pixelStride + (tenBit ? 2 : 1);
         final byte[] row = new byte[span];
         for (int y = 0; y < height; y++) {
             final int base = (top + y) * rowStride + left * pixelStride;
             final int dst = y * width;
-            if (base + span <= buffer.limit()) {
+            final boolean bulk = base + span <= buffer.limit();
+            if (bulk) {
                 buffer.position(base);
                 buffer.get(row, 0, span);
-                for (int x = 0; x < width; x++) {
-                    out[dst + x] = row[x * pixelStride + sampleOffset];
-                }
-            } else {
-                // The final row of a plane can stop short of a full stride.
-                for (int x = 0; x < width; x++) {
-                    out[dst + x] = buffer.get(base + x * pixelStride + sampleOffset);
+            }
+            for (int x = 0; x < width; x++) {
+                final int at = x * pixelStride;
+                if (tenBit) {
+                    // **Both bytes now, where this used to take the high one and
+                    // throw the rest away.** P010 stores ten bits in the high
+                    // bits of a little-endian 16-bit word, so the sample is the
+                    // pair shifted back down by six — not the top byte, which
+                    // silently cost two bits on every HDR clip.
+                    final int lo = (bulk ? row[at] : buffer.get(base + at)) & 0xFF;
+                    final int hi = (bulk ? row[at + 1] : buffer.get(base + at + 1)) & 0xFF;
+                    out[dst + x] = (short) ((((hi << 8) | lo) >> 6) & 0x3FF);
+                } else {
+                    final int v = (bulk ? row[at] : buffer.get(base + at)) & 0xFF;
+                    out[dst + x] = widen(v, fullRange);
                 }
             }
         }
     }
 
-    private byte[][] slotFor(int width, int height, int chromaWidth, int chromaHeight) {
+    private short[][] slotFor(int width, int height, int chromaWidth, int chromaHeight) {
         if (slotA == null || slotWidth != width || slotHeight != height) {
             slotWidth = width;
             slotHeight = height;
@@ -487,11 +594,11 @@ final class ClipReader {
         return slotA;
     }
 
-    private static byte[][] newSlot(int width, int height, int chromaWidth, int chromaHeight) {
-        return new byte[][]{
-                new byte[width * height],
-                new byte[chromaWidth * chromaHeight],
-                new byte[chromaWidth * chromaHeight],
+    private static short[][] newSlot(int width, int height, int chromaWidth, int chromaHeight) {
+        return new short[][]{
+                new short[width * height],
+                new short[chromaWidth * chromaHeight],
+                new short[chromaWidth * chromaHeight],
         };
     }
 

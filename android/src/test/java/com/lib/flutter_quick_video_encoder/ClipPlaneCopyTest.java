@@ -50,12 +50,15 @@ public class ClipPlaneCopyTest {
         final ByteBuffer buffer = plane(rowStride, 1, height);
         lay(buffer, rowStride, 1, 0, 0, width, height, 0, (x, y) -> 10 * y + x);
 
-        final byte[] out = new byte[width * height];
-        ClipReader.copyPlane(buffer, rowStride, 1, out, 0, 0, width, height, false);
+        final short[] out = new short[width * height];
+        ClipReader.copyPlane(buffer, rowStride, 1, out, 0, 0, width, height, false, false);
 
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                assertEquals("at " + x + "," + y, 10 * y + x, out[y * width + x] & 0xFF);
+                // Samples are ten bits now, and an 8-bit source is shifted up by
+                // two rather than widened — so the expectation shifts with it.
+                assertEquals("at " + x + "," + y,
+                        (10 * y + x) << 2, out[y * width + x] & 0x3FF);
             }
         }
     }
@@ -76,12 +79,15 @@ public class ClipPlaneCopyTest {
         // The channel we must not read, laid over the gaps.
         lay(buffer, rowStride, pixelStride, 0, 0, width, height, 1, (x, y) -> 200);
 
-        final byte[] out = new byte[width * height];
-        ClipReader.copyPlane(buffer, rowStride, pixelStride, out, 0, 0, width, height, false);
+        final short[] out = new short[width * height];
+        ClipReader.copyPlane(buffer, rowStride, pixelStride, out, 0, 0, width, height, false, false);
 
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                assertEquals("at " + x + "," + y, 10 * y + x, out[y * width + x] & 0xFF);
+                // Samples are ten bits now, and an 8-bit source is shifted up by
+                // two rather than widened — so the expectation shifts with it.
+                assertEquals("at " + x + "," + y,
+                        (10 * y + x) << 2, out[y * width + x] & 0x3FF);
             }
         }
     }
@@ -102,23 +108,32 @@ public class ClipPlaneCopyTest {
         lay(buffer, rowStride, 1, 0, 0, 10, 8, 0, (x, y) -> 250);
         lay(buffer, rowStride, 1, 2, 3, width, height, 0, (x, y) -> 10 * y + x);
 
-        final byte[] out = new byte[width * height];
-        ClipReader.copyPlane(buffer, rowStride, 1, out, 2, 3, width, height, false);
+        final short[] out = new short[width * height];
+        ClipReader.copyPlane(buffer, rowStride, 1, out, 2, 3, width, height, false, false);
 
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                assertEquals("at " + x + "," + y, 10 * y + x, out[y * width + x] & 0xFF);
+                // Samples are ten bits now, and an 8-bit source is shifted up by
+                // two rather than widened — so the expectation shifts with it.
+                assertEquals("at " + x + "," + y,
+                        (10 * y + x) << 2, out[y * width + x] & 0x3FF);
             }
         }
     }
 
     /**
-     * 10-bit output stores each sample in two little-endian bytes with the data
-     * left-aligned, so the high byte is the 8-bit value. Reading the low byte
-     * instead gives noise that looks like a corrupt decode.
+     * 10-bit output stores each sample in two little-endian bytes, left-aligned.
+     *
+     * <p><b>The low byte is precision, not padding, and this used to throw it
+     * away.</b> Taking the high byte alone gave an 8-bit sample from a ten-bit
+     * source — the frame still decoded, still converted and still looked
+     * plausible, two bits short, which is the only reason it survived. The
+     * expectation below carries those two bits explicitly: the value is the
+     * whole word shifted down by six, so the `0xC0` in the low byte contributes
+     * a 3 that a high-byte read cannot produce.
      */
     @Test
-    public void tenBitSamplesAreReadFromTheHighByte() {
+    public void tenBitSamplesKeepTheLowBitsToo() {
         final int width = 4;
         final int height = 2;
         final int rowStride = 16;
@@ -129,12 +144,15 @@ public class ClipPlaneCopyTest {
         // mistaken for the value.
         lay(buffer, rowStride, pixelStride, 0, 0, width, height, 0, (x, y) -> 0xC0);
 
-        final byte[] out = new byte[width * height];
-        ClipReader.copyPlane(buffer, rowStride, pixelStride, out, 0, 0, width, height, true);
+        final short[] out = new short[width * height];
+        ClipReader.copyPlane(buffer, rowStride, pixelStride, out, 0, 0, width, height, true, false);
 
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                assertEquals("at " + x + "," + y, 10 * y + x, out[y * width + x] & 0xFF);
+                // ((hi << 8) | lo) >> 6 — the trailing 3 is the low byte's 0xC0,
+                // and is exactly what a high-byte-only read would lose.
+                assertEquals("at " + x + "," + y,
+                        ((10 * y + x) << 2) | 3, out[y * width + x] & 0x3FF);
             }
         }
     }
@@ -149,12 +167,65 @@ public class ClipPlaneCopyTest {
         lay(buffer, rowStride, pixelStride, 0, 0, 5, 6, 1, (x, y) -> 250);
         lay(buffer, rowStride, pixelStride, 1, 2, width, height, 1, (x, y) -> 10 * y + x);
 
-        final byte[] out = new byte[width * height];
-        ClipReader.copyPlane(buffer, rowStride, pixelStride, out, 1, 2, width, height, true);
+        final short[] out = new short[width * height];
+        ClipReader.copyPlane(buffer, rowStride, pixelStride, out, 1, 2, width, height, true, false);
 
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                assertEquals("at " + x + "," + y, 10 * y + x, out[y * width + x] & 0xFF);
+                // Samples are ten bits now, and an 8-bit source is shifted up by
+                // two rather than widened — so the expectation shifts with it.
+                assertEquals("at " + x + "," + y,
+                        (10 * y + x) << 2, out[y * width + x] & 0x3FF);
+            }
+        }
+    }
+
+    /**
+     * An 8-bit clip has to come back out as the 8-bit clip it went in as.
+     *
+     * <p><b>Both ranges, because they widen by different rules and one rule for
+     * both is a silent one-code darkening.</b> Limited range is an exact shift;
+     * full range is not, and shifting there leaves white at 254 and every
+     * non-zero sample one low — over a whole clip, with nothing logged. The
+     * corpus contains full-range files, so this is reachable rather than
+     * theoretical: the action-cam footage is `yuvj420p`.
+     *
+     * <p>Every code, not a sample of them. The failure this guards against is
+     * uniform, so a handful of spot checks would catch it — but a widening that
+     * is wrong for only part of the range is the more likely future mistake, and
+     * 256 values is free.
+     */
+    @Test
+    public void anEightBitPlaneRoundTripsExactlyInBothRanges() {
+        for (int i = 0; i < 2; i++) {
+            final boolean fullRange = i == 1;
+            final int low = fullRange ? 0 : 16;
+            final int high = fullRange ? 255 : 235;
+            final int count = high - low + 1;
+
+            final ByteBuffer buffer = plane(count, 1, 1);
+            lay(buffer, count, 1, 0, 0, count, 1, 0, (x, y) -> low + x);
+
+            final short[] out = new short[count];
+            ClipReader.copyPlane(buffer, count, 1, out, 0, 0, count, 1, false, fullRange);
+
+            final ClipColor color = new ClipColor(
+                    ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, fullRange);
+            for (int v = low; v <= high; v++) {
+                final int decoded =
+                        (color.toRgb(out[v - low] & 0x3FF, 512, 512) >> 16) & 0xFF;
+                // Full range must come back as itself — that is what the ceiling
+                // widening buys. Limited range expands 16..235 onto 0..255, so
+                // the invariant is not identity but *agreement with the 8-bit
+                // path*: shifting by two leaves (4v-64)/876 equal to (v-16)/219,
+                // and the decode floors both the same way.
+                final int expected = fullRange
+                        ? v
+                        : (int) ((v - 16) * 255.0 / 219.0);
+                assertEquals((fullRange ? "full" : "limited") + " range code " + v
+                                + " widened to " + (out[v - low] & 0x3FF)
+                                + " and decoded to " + decoded,
+                        expected, decoded);
             }
         }
     }
@@ -170,12 +241,15 @@ public class ClipPlaneCopyTest {
         final ByteBuffer buffer = plane(width, 1, height);
         lay(buffer, width, 1, 0, 0, width, height, 0, (x, y) -> 10 * y + x);
 
-        final byte[] out = new byte[width * height];
-        ClipReader.copyPlane(buffer, width, 1, out, 0, 0, width, height, false);
+        final short[] out = new short[width * height];
+        ClipReader.copyPlane(buffer, width, 1, out, 0, 0, width, height, false, false);
 
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                assertEquals("at " + x + "," + y, 10 * y + x, out[y * width + x] & 0xFF);
+                // Samples are ten bits now, and an 8-bit source is shifted up by
+                // two rather than widened — so the expectation shifts with it.
+                assertEquals("at " + x + "," + y,
+                        (10 * y + x) << 2, out[y * width + x] & 0x3FF);
             }
         }
     }

@@ -22,18 +22,42 @@ import org.junit.Test;
  */
 public class ClipBlendTest {
 
+    /**
+     * An 8-bit code as its full-range 10-bit equivalent.
+     *
+     * <p><b>Not simply shifted by two.</b> These frames are full range, where
+     * 255 has to reach 1023 rather than 1020 — shifting alone leaves white three
+     * codes short and every gray decodes one low. Limited range *is* an exact
+     * shift, which is why `copyPlane` can use one and this cannot.
+     *
+     * <p>Ceiling-scaled, because `ClipColor`'s integer path floors on the way
+     * back to 8 bits, so the widened code has to sit at or above the exact
+     * v*1023/255 to survive it. Rounding puts half the values a fraction below
+     * — 200 becomes 802, which decodes to 199 — and bit replication only clears
+     * the floor where the replicated top bits contribute enough: 10 becomes 40,
+     * which decodes to 9. The ceiling is the smallest code that round-trips,
+     * and it does so for all 256 values.
+     */
+    private static short wide(int eightBit) {
+        return (short) ((eightBit * 1023 + 254) / 255);
+    }
+
     /** Full-range Rec.709 with neutral chroma, so a luma of g decodes to (g,g,g). */
     private static ClipFrame grayFrame(int width, int height, int... luma) {
-        final byte[] y = new byte[width * height];
+        final short[] y = new short[width * height];
         for (int i = 0; i < luma.length; i++) {
-            y[i] = (byte) luma[i];
+            y[i] = wide(luma[i]);
         }
         final int cw = (width + 1) / 2;
         final int ch = (height + 1) / 2;
-        final byte[] u = new byte[cw * ch];
-        final byte[] v = new byte[cw * ch];
-        Arrays.fill(u, (byte) 128);
-        Arrays.fill(v, (byte) 128);
+        // Neutral chroma is the 10-bit center code exactly, not a widened 128:
+        // wide(128) lands at 514, two codes off the 512 center, which pushes
+        // red and blue up a code and green down through the decode — a tint,
+        // where the test's whole premise is that the three channels agree.
+        final short[] u = new short[cw * ch];
+        final short[] v = new short[cw * ch];
+        Arrays.fill(u, (short) 512);
+        Arrays.fill(v, (short) 512);
         return new ClipFrame(y, u, v, width, height,
                 new ClipColor(ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, true), 0L,
                 false);
@@ -185,11 +209,11 @@ public class ClipBlendTest {
      */
     @Test
     public void chromaIsSharedAcrossEachTwoByTwoBlock() {
-        final byte[] luma = new byte[16];
-        Arrays.fill(luma, (byte) 128);
+        final short[] luma = new short[16];
+        Arrays.fill(luma, wide(128));
         // Two chroma columns: the left one pushed red, the right one pushed blue.
-        final byte[] cb = {(byte) 128, (byte) 200, (byte) 128, (byte) 200};
-        final byte[] cr = {(byte) 200, (byte) 128, (byte) 200, (byte) 128};
+        final short[] cb = {wide(128), wide(200), wide(128), wide(200)};
+        final short[] cr = {wide(200), wide(128), wide(200), wide(128)};
         final ClipFrame clip = new ClipFrame(luma, cb, cr, 4, 4,
                 new ClipColor(ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, true), 0L,
                 false);

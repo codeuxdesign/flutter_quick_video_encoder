@@ -39,7 +39,10 @@ public class FrameYuvTest {
         final int u = yuv[frameSize] & 0xFF;
         final int v = yuv[frameSize + frameSize / 4] & 0xFF;
 
-        final int rgb = REC709_LIMITED.toRgb(y, u, v);
+        // `FrameYuv` writes the 8-bit planes the encoder takes; `ClipColor` now
+        // reads ten-bit codes. Limited range shifts exactly — 16 to 64 and 235
+        // to 940 — so this is the same round trip, not a rescaled one.
+        final int rgb = REC709_LIMITED.toRgb(y << 2, u << 2, v << 2);
         return new int[]{(rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF};
     }
 
@@ -110,7 +113,10 @@ public class FrameYuvTest {
         final int u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
         final int v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
 
-        final int rgb = REC709_LIMITED.toRgb(y, u, v);
+        // `FrameYuv` writes the 8-bit planes the encoder takes; `ClipColor` now
+        // reads ten-bit codes. Limited range shifts exactly — 16 to 64 and 235
+        // to 940 — so this is the same round trip, not a rescaled one.
+        final int rgb = REC709_LIMITED.toRgb(y << 2, u << 2, v << 2);
         final int outR = (rgb >> 16) & 0xFF;
         final int outG = (rgb >> 8) & 0xFF;
         final int outB = rgb & 0xFF;
