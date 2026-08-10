@@ -129,24 +129,99 @@ public class ClipColorTest {
      * "bright" would pass with the HLG handling deleted.
      */
     @Test
-    public void hlgDiffuseWhiteIsBrightButLeavesHeadroom() {
+    public void hlgDiffuseWhiteMatchesTheStandardsOwnAnswer() {
         final ClipColor hlg =
                 new ClipColor(ClipColor.STANDARD_BT2020, ClipColor.TRANSFER_HLG, false);
         final ClipColor sdr =
                 new ClipColor(ClipColor.STANDARD_BT2020, ClipColor.TRANSFER_SDR, false);
 
-        final int code = limitedCode(0.75);
-        final int converted = red(hlg.toRgb(code, 128, 128));
-        final int ignored = red(sdr.toRgb(code, 128, 128));
+        // Diffuse white in display light, normalized so 1.0 is the 1 000 cd/m2
+        // BT.2446 assumes. Worked out here from BT.2100 rather than read back out
+        // of the implementation: the HLG inverse OETF, then the OOTF at gamma 1.2.
+        final double a = 0.17883277;
+        final double b = 1.0 - 4.0 * a;
+        final double c = 0.5 - a * Math.log(4.0 * a);
+        final double scene = (Math.exp((0.75 - c) / a) + b) / 12.0;
+        final double display = Math.pow(scene, 1.2);
 
-        assertTrue("HLG diffuse white came out at " + converted + ", not bright enough",
-                converted >= 200);
-        assertTrue("HLG diffuse white came out at " + converted + ", which is at or near "
-                        + "the ceiling — nothing above white can be shown from there",
-                converted <= 245);
-        assertTrue("treating HLG as SDR gave " + ignored + ", which is not far enough"
-                        + " from " + converted + " for this test to mean anything",
+        final int expected = methodAneutral(display);
+        final int converted = red(hlg.toRgb(limitedCode(0.75), 128, 128));
+
+        assertTrue("HLG diffuse white came out at " + converted + ", but Report ITU-R "
+                        + "BT.2446-1 Method A puts it at " + expected,
+                Math.abs(converted - expected) <= 2);
+
+        // Still has to be a long way from ignoring the transfer, or the test
+        // would pass with the HLG handling deleted.
+        final int ignored = red(sdr.toRgb(limitedCode(0.75), 128, 128));
+        assertTrue("treating HLG as SDR gave " + ignored + ", too close to " + converted,
                 Math.abs(converted - ignored) >= 20);
+    }
+
+    /**
+     * The tone map across its whole range, against the standard's own numbers.
+     *
+     * <p><b>All three branches, because one point tests one branch.</b> The
+     * diffuse-white check above lands at {@code Yp' ≈ 0.77}, inside the
+     * quadratic segment — so corrupting the linear segment's coefficient left it
+     * green, and only the monotonicity test noticed. Found by deliberately
+     * breaking the constant and watching which tests cared.
+     */
+    @Test
+    public void theToneMapFollowsMethodAAcrossItsWholeRange() {
+        final ClipColor hlg =
+                new ClipColor(ClipColor.STANDARD_BT2020, ClipColor.TRANSFER_HLG, false);
+
+        // Signals spanning deep shadow to peak, so every segment of the knee and
+        // both of its joins are covered.
+        final double[] signals = {0.10, 0.25, 0.40, 0.55, 0.65, 0.75, 0.85, 0.93, 0.98, 1.0};
+        final double a = 0.17883277;
+        final double b = 1.0 - 4.0 * a;
+        final double c = 0.5 - a * Math.log(4.0 * a);
+
+        for (final double signal : signals) {
+            final double scene = signal <= 0.5
+                    ? signal * signal / 3.0
+                    : (Math.exp((signal - c) / a) + b) / 12.0;
+            final int expected = methodAneutral(Math.pow(scene, 1.2));
+            final int actual = red(hlg.toRgb(limitedCode(signal), 128, 128));
+            assertTrue("signal " + signal + " converted to " + actual
+                            + ", but Method A puts it at " + expected,
+                    Math.abs(actual - expected) <= 2);
+        }
+    }
+
+    /**
+     * Method A applied to a neutral, worked out from the published constants.
+     *
+     * <p>Independent of {@link ClipColor} on purpose. A test that asked the
+     * implementation what it produces and then asserted that number would pass
+     * for any implementation, which is the failure that let the clamp survive.
+     * The chroma terms vanish for a neutral, so this is the luma path alone.
+     */
+    private static int methodAneutral(double displayLinearAtPeak) {
+        final double rho = 1.0 + 32.0 * Math.pow(1000.0 / 10000.0, 1.0 / 2.4);
+        final double rhoSdr = 1.0 + 32.0 * Math.pow(100.0 / 10000.0, 1.0 / 2.4);
+
+        final double yHdr = Math.pow(displayLinearAtPeak, 1.0 / 2.4);
+        final double yp = Math.log(1.0 + (rho - 1.0) * yHdr) / Math.log(rho);
+        final double yc;
+        if (yp <= 0.7399) {
+            yc = 1.0770 * yp;
+        } else if (yp < 0.9909) {
+            yc = -1.1510 * yp * yp + 2.7811 * yp - 0.6302;
+        } else {
+            yc = 0.5000 * yp + 0.5000;
+        }
+        final double ySdr = (Math.pow(rhoSdr, yc) - 1.0) / (rhoSdr - 1.0);
+
+        // Back to linear, then the sRGB encode. A neutral survives the
+        // BT.2020 to Rec.709 matrix unchanged because each row sums to one.
+        final double linear = Math.pow(ySdr, 2.4);
+        final double encoded = linear <= 0.0031308
+                ? 12.92 * linear
+                : 1.055 * Math.pow(linear, 1.0 / 2.4) - 0.055;
+        return (int) Math.round(255.0 * encoded);
     }
 
     /**
@@ -234,12 +309,11 @@ public class ClipColorTest {
         final double y = Math.pow(203.0 / 10000.0, m1);
         final double signal = Math.pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
 
+        // 203 cd/m2 against the 1 000 cd/m2 peak BT.2446 assumes.
+        final int expected = methodAneutral(203.0 / 1000.0);
         final int converted = red(pq.toRgb(limitedCode(signal), 128, 128));
-        assertTrue("PQ reference white came out at " + converted + ", too dark",
-                converted >= 200);
-        assertTrue("PQ reference white came out at " + converted + ", at the ceiling — "
-                        + "every specular highlight above it would clip to the same value",
-                converted <= 245);
+        assertTrue("PQ reference white came out at " + converted + ", but Method A puts "
+                        + "it at " + expected, Math.abs(converted - expected) <= 2);
     }
 
     @Test

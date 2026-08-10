@@ -65,24 +65,17 @@ final class ClipColor {
     private static final double HLG_GAMMA = 1.2;
 
     /**
-     * Where diffuse white lands in the SDR output, and where the roll-off starts.
+     * Peak luminances the tone map is specified against, in cd/m2.
      *
-     * <p><b>These two numbers are the whole highlight decision, and the first one
-     * has to be below 1.0 for the second to mean anything.</b> After the OOTF an
-     * HLG signal runs from 0 to {@code hlgScale}, which works out near 7.5 — so
-     * the picture carries seven and a half times diffuse white. Mapping diffuse
-     * white to 1.0, as this did, leaves *nothing* above it and every highlight
-     * becomes the same flat white: a sun and the sky behind it render as one
-     * shape. Reserving headroom is not a stylistic preference, it is the only way
-     * the range above white can be shown at all, and it is why a correct HDR→SDR
-     * render looks slightly darker than a clipped one rather than brighter.
-     *
-     * <p>Measured against AVFoundation converting the same drone frame, which
-     * reserves headroom the same way and is why its mean sat at 66 against our
-     * 92 while its sun stayed a disc.
+     * <p>Report ITU-R BT.2446-1 §4.1 maps a 1 000 cd/m2 HDR signal to a 100
+     * cd/m2 SDR display. HLG is nominally mastered at 1 000, so the assumption
+     * holds for the footage this reads.
      */
-    private static final float SDR_DIFFUSE_TARGET = 0.75f;
-    private static final float SDR_KNEE = 0.6f;
+    private static final double TONE_MAP_HDR_NITS = 1000.0;
+    private static final double TONE_MAP_SDR_NITS = 100.0;
+
+    /** How finely the tone map and the two gamma curves are sampled. */
+    private static final int TONE_LUT = 4096;
 
     /**
      * The signal level BT.2408 calls HLG reference white. Mapping it to sRGB
@@ -157,6 +150,13 @@ final class ClipColor {
     private float[] ootfGain;
     private byte[] toSrgbLow;
     private byte[] toSrgbHigh;
+    /** Linear 0..1 to its 1/2.4 gamma signal, and back. BT.2446 works in that domain. */
+    private float[] gammaEncode24;
+    private float[] gammaDecode24;
+    /** The luma tone map of §4.1 steps 1 to 3, collapsed into one curve as the report allows. */
+    private float[] lumaToneMap;
+    /** Scales display-linear so 1.0 means the 1 000 cd/m2 the report assumes. */
+    private float toPeakNormalized;
     private float hlgScale;
     private float lumaR;
     private float lumaG;
@@ -260,6 +260,10 @@ final class ClipColor {
             hlgScale = (float) (1.0 / display);
         }
 
+        if (compressHighlights) {
+            buildToneMap();
+        }
+
         toSrgbLow = new byte[ENCODE_LOW_LUT];
         for (int i = 0; i < ENCODE_LOW_LUT; i++) {
             final double x = ENCODE_SPLIT * i / (ENCODE_LOW_LUT - 1);
@@ -309,19 +313,38 @@ final class ClipColor {
         }
 
         if (compressHighlights) {
-            // **On luminance, scaling all three channels together — not per
-            // channel.** Rolling each channel off on its own changes the ratios
-            // between them, so a bright saturated area drifts in hue as it
-            // brightens and a sunset goes yellow at the edges. Scaling by a
-            // single factor moves the pixel along its own colour, which is what
-            // makes the highlight recover detail rather than change shade.
-            final float luminance = lumaR * r + lumaG * g + lumaB * b;
-            if (luminance > 0.0f) {
-                final float gain = rolledOff(luminance) / luminance;
-                r *= gain;
-                g *= gain;
-                b *= gain;
+            // Report ITU-R BT.2446-1 §4.1, Tables 2 and 3.
+            final float rp = sampled(gammaEncode24, r * toPeakNormalized);
+            final float gp = sampled(gammaEncode24, g * toPeakNormalized);
+            final float bp = sampled(gammaEncode24, b * toPeakNormalized);
+
+            final float yHdr = 0.2627f * rp + 0.6780f * gp + 0.0593f * bp;
+            final float ySdr = sampled(lumaToneMap, yHdr);
+
+            // Table 3. **The half an invented curve does not have.** Lowering
+            // the luminance of a picture changes how saturated its colours look,
+            // so the chroma has to be rescaled against how far the luma moved or
+            // the result reads as washed out at exactly the brightnesses the
+            // tone map touched most.
+            float cb = 0.0f;
+            float cr = 0.0f;
+            if (yHdr > 0.0f) {
+                final float f = ySdr / (1.1f * yHdr);
+                cb = f * (bp - yHdr) / 1.8814f;
+                cr = f * (rp - yHdr) / 1.4746f;
             }
+            final float yTmo = ySdr - Math.max(0.1f * cr, 0.0f);
+
+            // Back to R'G'B', still BT.2020 and still in the 1/2.4 domain.
+            final float rTmo = yTmo + 1.4746f * cr;
+            final float bTmo = yTmo + 1.8814f * cb;
+            final float gTmo = yTmo
+                    - (0.2627f * 1.4746f / 0.6780f) * cr
+                    - (0.0593f * 1.8814f / 0.6780f) * cb;
+
+            r = sampled(gammaDecode24, clamp01(rTmo));
+            g = sampled(gammaDecode24, clamp01(gTmo));
+            b = sampled(gammaDecode24, clamp01(bTmo));
         }
 
         if (standard == STANDARD_BT2020) {
@@ -340,27 +363,83 @@ final class ClipColor {
     }
 
     /**
-     * Display luminance after the highlight roll-off, still linear.
+     * The tables for Report ITU-R BT.2446-1 §4.1, "conversion Method A".
      *
-     * <p>Diffuse white arrives here as 1.0 and the brightest an HLG signal can
-     * reach is about 7.5. The curve scales by {@link #SDR_DIFFUSE_TARGET} first,
-     * so white sits below the ceiling and there is somewhere for the rest to go,
-     * then bends what is left asymptotically towards 1.0.
+     * <p><b>Why a published method rather than a curve of our own.</b> The first
+     * attempt here was an invented exponential shoulder, and it was wrong in two
+     * ways that reading the report made obvious. It bent the curve in *linear
+     * light*, where a knee does not correspond to anything the eye does —
+     * Method A moves into a perceptual domain first, bends there, and comes back.
+     * And it left chroma untouched, so the picture darkened while its colours did
+     * not, which the report addresses directly: brightness and perceived
+     * saturation interact (the Hunt effect), so a conversion that changes one
+     * must correct the other.
      *
-     * <p>{@code k + (1-k)(1 - e^-((s-k)/(1-k)))} is chosen for three properties
-     * rather than for its shape: it passes through the knee exactly, its slope
-     * there is exactly one — so nothing below the knee is disturbed and nothing
-     * kinks at it — and it approaches 1.0 without ever reaching it, so no input,
-     * however bright, can clip. A curve that clipped at some large value would
-     * reintroduce the original defect for a bright enough sky.
+     * <p>Method A rather than B or C, and the report says what each is for. B is
+     * aimed at live SDR sources whose over-exposed areas must not be amplified on
+     * the way *up*. C is parametric, tuned per content from skin tones. A targets
+     * "movies and episodic content … produced to a high visual quality", which is
+     * what a drone clip is. It is also the one with an independent implementation
+     * to check against — `bt.2446a` in libplacebo, which mpv, VLC and ffmpeg use
+     * — and that matters more than the curve's shape: it is the difference
+     * between a documented method and matching whatever AVFoundation happened to
+     * do this year.
+     *
+     * <p>Sampled into tables rather than evaluated per pixel. The report notes
+     * the luma path can be a single 1-D look-up, and a {@code Math.pow} per
+     * channel is exactly the cost that put 400 ms on a frame once already.
      */
-    private static float rolledOff(float displayLinear) {
-        final float s = displayLinear * SDR_DIFFUSE_TARGET;
-        if (s <= SDR_KNEE) {
-            return s;
+    private void buildToneMap() {
+        // Normalize display light so 1.0 is the report's 1 000 cd/m2. The HLG
+        // path already peaks at 1.0 before `hlgScale` lifts diffuse white, so
+        // undo that lift; PQ arrives normalized to 203 cd/m2 instead.
+        toPeakNormalized = transfer == TRANSFER_HLG
+                ? 1.0f / hlgScale
+                : (float) (PQ_REFERENCE_WHITE_NITS / TONE_MAP_HDR_NITS);
+
+        gammaEncode24 = new float[TONE_LUT];
+        gammaDecode24 = new float[TONE_LUT];
+        for (int i = 0; i < TONE_LUT; i++) {
+            final double x = (double) i / (TONE_LUT - 1);
+            gammaEncode24[i] = (float) Math.pow(x, 1.0 / 2.4);
+            gammaDecode24[i] = (float) Math.pow(x, 2.4);
         }
-        final float head = 1.0f - SDR_KNEE;
-        return SDR_KNEE + head * (float) (1.0 - Math.exp(-(s - SDR_KNEE) / head));
+
+        final double rhoHdr =
+                1.0 + 32.0 * Math.pow(TONE_MAP_HDR_NITS / 10000.0, 1.0 / 2.4);
+        final double rhoSdr =
+                1.0 + 32.0 * Math.pow(TONE_MAP_SDR_NITS / 10000.0, 1.0 / 2.4);
+
+        lumaToneMap = new float[TONE_LUT];
+        for (int i = 0; i < TONE_LUT; i++) {
+            final double yHdr = (double) i / (TONE_LUT - 1);
+
+            // Step 1: into the perceptual domain.
+            final double yp = Math.log(1.0 + (rhoHdr - 1.0) * yHdr) / Math.log(rhoHdr);
+
+            // Step 2: the knee, stated there and nowhere else.
+            final double yc;
+            if (yp <= 0.7399) {
+                yc = 1.0770 * yp;
+            } else if (yp < 0.9909) {
+                yc = -1.1510 * yp * yp + 2.7811 * yp - 0.6302;
+            } else {
+                yc = 0.5000 * yp + 0.5000;
+            }
+
+            // Step 3: back out, against the SDR display this time.
+            lumaToneMap[i] = (float) ((Math.pow(rhoSdr, yc) - 1.0) / (rhoSdr - 1.0));
+        }
+    }
+
+    private float sampled(float[] table, float x) {
+        if (x <= 0.0f) {
+            return table[0];
+        }
+        if (x >= 1.0f) {
+            return table[table.length - 1];
+        }
+        return table[(int) (x * (table.length - 1) + 0.5f)];
     }
 
     private int srgbByte(float linear) {
