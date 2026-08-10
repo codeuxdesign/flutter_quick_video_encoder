@@ -89,6 +89,7 @@ final class ClipReader {
 
     private boolean inputDone;
     private boolean outputDone;
+    private boolean loggedLayout;
     private int seekCount;
     private int decodedFrames;
 
@@ -373,12 +374,41 @@ final class ClipReader {
         final byte[][] slot = slotFor(width, height, chromaWidth, chromaHeight);
 
         final Image.Plane[] planes = image.getPlanes();
-        copyPlane(planes[0], slot[0], left, top, width, height, tenBit);
-        copyPlane(planes[1], slot[1], left / 2, top / 2, chromaWidth, chromaHeight, tenBit);
-        copyPlane(planes[2], slot[2], left / 2, top / 2, chromaWidth, chromaHeight, tenBit);
+        logLayoutOnce(image, planes, format, left, top, width, height);
+        copyPlane(planes[0].getBuffer(), planes[0].getRowStride(), planes[0].getPixelStride(),
+                slot[0], left, top, width, height, tenBit);
+        copyPlane(planes[1].getBuffer(), planes[1].getRowStride(), planes[1].getPixelStride(),
+                slot[1], left / 2, top / 2, chromaWidth, chromaHeight, tenBit);
+        copyPlane(planes[2].getBuffer(), planes[2].getRowStride(), planes[2].getPixelStride(),
+                slot[2], left / 2, top / 2, chromaWidth, chromaHeight, tenBit);
 
         return new ClipFrame(slot[0], slot[1], slot[2], width, height, color,
                 presentationTimeUs);
+    }
+
+    /**
+     * The layout this device actually handed back, printed once per clip.
+     *
+     * <p>Effective, not intended. `COLOR_FormatYUV420Flexible` is a family — one
+     * device is planar with a chroma pixel stride of 1, the next semiplanar with
+     * 2, and the row stride is whatever the hardware wanted — and code written
+     * against one of them is wrong on the others with no error anywhere. When a
+     * clip comes out sheared or the wrong color on somebody's phone, this line is
+     * the difference between reading it off the log and guessing.
+     */
+    private void logLayoutOnce(Image image, Image.Plane[] planes, int format,
+                               int left, int top, int width, int height) {
+        if (loggedLayout) {
+            return;
+        }
+        loggedLayout = true;
+        Log.i(TAG, "CLIP layout " + path
+                + " format=" + format
+                + " buffer=" + image.getWidth() + "x" + image.getHeight()
+                + " used=" + width + "x" + height + "+" + left + "+" + top
+                + " y(row=" + planes[0].getRowStride() + ",px=" + planes[0].getPixelStride() + ")"
+                + " u(row=" + planes[1].getRowStride() + ",px=" + planes[1].getPixelStride() + ")"
+                + " v(row=" + planes[2].getRowStride() + ",px=" + planes[2].getPixelStride() + ")");
     }
 
     /**
@@ -388,13 +418,17 @@ final class ClipReader {
      * planar device and 2 on a semiplanar one. For 10-bit output each sample is
      * two little-endian bytes with the data in the top bits, so the high byte
      * alone is the 8-bit value — which is all an 8-bit sRGB frame can carry.
+     *
+     * <p><b>Takes a buffer and its strides rather than an {@code Image.Plane},
+     * so that it can be tested at all.</b> Every device this has run on hands
+     * back the friendliest layout there is — planar, no padding, no crop — so
+     * the branches that matter are exactly the ones a real run never exercises.
+     * Given the numbers instead of the plane, a plain JVM test can lay out a
+     * semiplanar, padded or 10-bit buffer by hand and check what comes out.
      */
-    private static void copyPlane(Image.Plane plane, byte[] out,
-                                  int left, int top, int width, int height,
-                                  boolean tenBit) {
-        final ByteBuffer buffer = plane.getBuffer();
-        final int rowStride = plane.getRowStride();
-        final int pixelStride = plane.getPixelStride();
+    static void copyPlane(ByteBuffer buffer, int rowStride, int pixelStride, byte[] out,
+                          int left, int top, int width, int height,
+                          boolean tenBit) {
         final int sampleOffset = tenBit ? 1 : 0;
 
         if (!tenBit && pixelStride == 1) {

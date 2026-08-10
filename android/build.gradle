@@ -21,6 +21,7 @@ android {
 
     defaultConfig {
         minSdkVersion 19
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
 
     gradle.projectsEvaluated {
@@ -41,6 +42,14 @@ android {
 // to compare against.
 //
 //   (cd app/android && ./gradlew :flutter_quick_video_encoder:testDebugUnitTest)
+//
+// The codec half needs a running Android, and there `ClipReader` is driven
+// against a clip the test synthesizes rather than against a fixture, so the
+// expected frame at every instant is known by construction:
+//
+//   (cd app/android && ./gradlew :flutter_quick_video_encoder:connectedDebugAndroidTest)
 dependencies {
     testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test:runner:1.5.2'
 }
