@@ -19,6 +19,52 @@ CMSampleBufferRef createAudioSampleBuffer(int fps, int audioFrameIdx, int audioC
 
 @class FQVEClipReader;
 
+/// The first track of [type], with the asset's `tracks` loaded before it is read.
+///
+/// **`tracksWithMediaType:` on its own can return an empty array for a file that
+/// is perfectly valid.** Since iOS 15 and macOS 12 the synchronous `AVAsset`
+/// accessors no longer block to load the property they are reading — they answer
+/// with whatever has been loaded so far, which for an asset created moments ago
+/// is nothing. It is timing-dependent, so it fails intermittently and passes
+/// under a debugger.
+///
+/// Observed once: a mux refused a freshly written render with `MuxNoVideoTrack`
+/// on a file `ffprobe` reads as 4339 frames of h264. `finish` had already waited
+/// on `finishWritingWithCompletionHandler`, so the file was complete; the reader
+/// simply had not looked yet.
+///
+/// **One helper rather than three call sites, because the three fail
+/// differently.** In the mux an empty result becomes a FlutterError, which is
+/// loud. In `FQVEClipReader` it becomes a nil reader, and the compositor's
+/// documented behaviour is to leave that rectangle as the painter cleared it —
+/// which encodes as a *black window in the film with no error anywhere*. Fixing
+/// the loud one and leaving the silent one is the worse outcome of the two, and
+/// a shared helper is what makes that impossible.
+///
+/// `loadValuesAsynchronouslyForKeys:` rather than the newer
+/// `loadTracksWithMediaType:completionHandler:`, which would raise the
+/// deployment target for no benefit here. The wait is bounded: a load that never
+/// completes returns nil rather than hanging the platform thread, because a
+/// wedged export is harder to diagnose than a refused one.
+static AVAssetTrack *FQVEFirstTrack(AVURLAsset *asset, AVMediaType type) {
+    if (!asset) { return nil; }
+    dispatch_semaphore_t loaded = dispatch_semaphore_create(0);
+    [asset loadValuesAsynchronouslyForKeys:@[ @"tracks" ]
+                         completionHandler:^{ dispatch_semaphore_signal(loaded); }];
+    if (dispatch_semaphore_wait(
+            loaded, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0) {
+        NSLog(@"FQVE: timed out loading tracks for %@", asset.URL.lastPathComponent);
+        return nil;
+    }
+    NSError *error = nil;
+    if ([asset statusOfValueForKey:@"tracks" error:&error] != AVKeyValueStatusLoaded) {
+        NSLog(@"FQVE: tracks did not load for %@: %@",
+              asset.URL.lastPathComponent, error);
+        return nil;
+    }
+    return [[asset tracksWithMediaType:type] firstObject];
+}
+
 /// This device's thermal state, on a scale both platforms share.
 ///
 /// **The normalization is the point, not the reading.** Apple reports four
@@ -82,7 +128,7 @@ static void blendClipIntoFrame(uint8_t *dst, int frameWidth, int frameHeight,
     if (!self) { return nil; }
 
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-    AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    AVAssetTrack *track = FQVEFirstTrack(asset, AVMediaTypeVideo);
     if (!track) { return nil; }
 
     NSError *error = nil;
@@ -693,8 +739,8 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     AVURLAsset *videoAsset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:videoPath] options:nil];
     AVURLAsset *audioAsset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:audioPath] options:nil];
 
-    AVAssetTrack *videoTrack = [[videoAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-    AVAssetTrack *audioTrack = [[audioAsset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+    AVAssetTrack *videoTrack = FQVEFirstTrack(videoAsset, AVMediaTypeVideo);
+    AVAssetTrack *audioTrack = FQVEFirstTrack(audioAsset, AVMediaTypeAudio);
     if (videoTrack == nil) {
         result([FlutterError errorWithCode:@"MuxNoVideoTrack" message:videoPath details:nil]);
         return;
