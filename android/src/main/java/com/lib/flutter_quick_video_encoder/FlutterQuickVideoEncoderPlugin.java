@@ -82,6 +82,12 @@ public class FlutterQuickVideoEncoderPlugin implements
      */
     private ClipCompositor mClipCompositor;
 
+    /**
+     * Says when the phone starts throttling, so a slower render has a reason
+     * attached to it rather than being a number nobody can account for.
+     */
+    private ThermalWatch mThermal;
+
     // input queue for video, audio, and stop signals
     private BlockingQueue<InputData> inputQueue = new LinkedBlockingQueue<>(5);
 
@@ -95,12 +101,17 @@ public class FlutterQuickVideoEncoderPlugin implements
         BinaryMessenger messenger = binding.getBinaryMessenger();
         mMethodChannel = new MethodChannel(messenger, CHANNEL_NAME);
         mMethodChannel.setMethodCallHandler(this);
+        mThermal = ThermalWatch.of(binding.getApplicationContext());
     }
 
     @Override
     public void onDetachedFromEngine(FlutterPluginBinding binding) {
         mMethodChannel.setMethodCallHandler(null);
         releaseClipCompositor();
+        if (mThermal != null) {
+            mThermal.close();
+            mThermal = null;
+        }
     }
 
     private void releaseClipCompositor() {
@@ -251,6 +262,15 @@ public class FlutterQuickVideoEncoderPlugin implements
 
                     byte[] rawRgba = call.argument("rawRgba");
 
+                    // Sampled per frame, reported only when it changes or once
+                    // every ten seconds. The moment throttling starts is the
+                    // event that explains a slowdown, and a purely periodic
+                    // sample would put it up to its own interval away from where
+                    // it happened.
+                    if (mThermal != null) {
+                        mThermal.sample(mVideoFrameIdx);
+                    }
+
                     // Fill the caller's holes with video before anything is
                     // encoded.
                     //
@@ -315,6 +335,25 @@ public class FlutterQuickVideoEncoderPlugin implements
 
                     // Return immediately
                     result.success(null);
+                    break;
+                }
+                case "thermalStatus":
+                {
+                    // For the Dart side, so a rider can be told *why* an export
+                    // slowed down and a `PERF` row can say what it was measured
+                    // under. A row that cannot name its thermal state invites
+                    // two runs to be compared that never asked the same
+                    // question — the same reason `host=` and `mode=` are there.
+                    //
+                    // `worthReporting` is the platform's own judgement rather
+                    // than the caller's: LIGHT is normal under sustained load
+                    // and saying so would only train people to ignore it.
+                    Map<String, Object> thermal = new java.util.LinkedHashMap<>();
+                    int status = mThermal == null ? -1 : mThermal.currentStatus();
+                    thermal.put("status", status);
+                    thermal.put("name", ThermalWatch.describe(status));
+                    thermal.put("throttling", ThermalWatch.worthReporting(status));
+                    result.success(thermal);
                     break;
                 }
                 case "checkClipsDecodable":
