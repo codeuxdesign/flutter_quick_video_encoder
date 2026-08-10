@@ -267,21 +267,30 @@ final class ClipReader {
      */
     private static final int COLOR_FormatYUVP010 = 54;
 
-    /** Whether the track claims more than eight bits per sample. */
+    /**
+     * Whether the track claims more than eight bits per sample.
+     *
+     * <p><b>The profile, and only the profile. Transfer function is not bit
+     * depth.</b> This first also treated any HLG or PQ file as ten-bit, on the
+     * theory that a profile key might be missing — and that broke every 8-bit
+     * HDR clip on the device, including the corpus one, which is BT.2020 with an
+     * HLG transfer and eight bits per sample. Asking a decoder for P010 on an
+     * 8-bit stream does not fail loudly: it produces no frames at all, and the
+     * export reports "decoded no frames at 0us".
+     *
+     * <p>The two are separate axes and conflating them is the same mistake in
+     * code that PLAN §7 item 8 exists to correct in prose. A file that declares
+     * no profile keeps the portable 8-bit path, which costs two bits on a clip
+     * that did not say what it was — much better than not decoding it.
+     */
     private boolean isTenBitSource() {
-        // Main10 and its HDR profiles. A file can also say so through its
-        // transfer function, which is the more reliable signal in practice
-        // because profile keys are not always present on the track format.
-        if (color != null && color.transfer != ClipColor.TRANSFER_SDR) {
-            return true;
+        if (!trackFormat.containsKey(MediaFormat.KEY_PROFILE)) {
+            return false;
         }
-        if (trackFormat.containsKey(MediaFormat.KEY_PROFILE)) {
-            final int profile = trackFormat.getInteger(MediaFormat.KEY_PROFILE);
-            return profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
-                    || profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10
-                    || profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10Plus;
-        }
-        return false;
+        final int profile = trackFormat.getInteger(MediaFormat.KEY_PROFILE);
+        return profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
+                || profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10
+                || profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10Plus;
     }
 
     /**
