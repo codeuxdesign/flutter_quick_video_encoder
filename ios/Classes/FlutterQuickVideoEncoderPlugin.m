@@ -198,9 +198,11 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     verbose = 3,
 };
 
-@interface FlutterQuickVideoEncoderPlugin ()
+@interface FlutterQuickVideoEncoderPlugin () <FlutterStreamHandler>
 @property(nonatomic) NSObject<FlutterPluginRegistrar> *registrar;
 @property(nonatomic) FlutterMethodChannel *mMethodChannel;
+@property(nonatomic) FlutterEventChannel *mThermalChannel;
+@property(nonatomic, copy) FlutterEventSink mThermalSink;
 @property(nonatomic) LogLevel mLogLevel;
 @property(nonatomic) AVAssetWriter *mAssetWriter;
 @property(nonatomic) AVAssetWriterInput *mAudioInput;
@@ -242,6 +244,63 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
     instance.mLogLevel = verbose;
 
     [registrar addMethodCallDelegate:instance channel:methodChannel];
+
+    // **Pushed, not polled, and one source for two consumers.** The perf row
+    // wants transitions to build a trace; the Export gauge wants the current
+    // rung to draw a thermometer. Asking twice invites the two to disagree
+    // about the same device at the same moment.
+    //
+    // Same channel name and same payload as the Android side, because a row
+    // from an iPhone and a row from a Galaxy have to be comparable — that is
+    // the whole reason `level` is normalized rather than each platform's own
+    // enum.
+    instance.mThermalChannel =
+        [FlutterEventChannel eventChannelWithName:@"flutter_quick_video_encoder/thermal"
+                                  binaryMessenger:[registrar messenger]];
+    [instance.mThermalChannel setStreamHandler:instance];
+}
+
+- (FlutterError *)onListenWithArguments:(id)arguments eventSink:(FlutterEventSink)events {
+    self.mThermalSink = events;
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+           selector:@selector(thermalStateChanged:)
+               name:NSProcessInfoThermalStateDidChangeNotification
+             object:nil];
+    // Immediately, because a subscriber that arrives mid-render would otherwise
+    // wait for the next transition to learn anything — and a device that has
+    // already reached its ceiling may never have another one.
+    events(currentThermalState());
+    return nil;
+}
+
+- (FlutterError *)onCancelWithArguments:(id)arguments {
+    [[NSNotificationCenter defaultCenter]
+        removeObserver:self
+                  name:NSProcessInfoThermalStateDidChangeNotification
+                object:nil];
+    self.mThermalSink = nil;
+    return nil;
+}
+
+- (void)thermalStateChanged:(NSNotification *)notification {
+    FlutterEventSink sink = self.mThermalSink;
+    if (sink == nil) {
+        return;
+    }
+    NSDictionary *thermal = currentThermalState();
+    // The notification arrives on an arbitrary queue and a sink is not
+    // thread-safe, so hop deliberately rather than hoping they coincide.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.mThermalSink != nil) {
+            self.mThermalSink(thermal);
+        }
+    });
+    // No log here. The per-frame check in `appendVideoFrame` already prints
+    // transitions with the frame they happened on, and it does so whether or
+    // not anything is subscribed — which is what a bench run needs. Logging in
+    // both places would print every transition twice and teach people to skim
+    // the line.
 }
 
 - (void)handleMethodCall:(FlutterMethodCall *)call result:(FlutterResult)result
