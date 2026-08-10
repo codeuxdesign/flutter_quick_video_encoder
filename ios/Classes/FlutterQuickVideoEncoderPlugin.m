@@ -1,4 +1,5 @@
 #import "FlutterQuickVideoEncoderPlugin.h"
+#import "FQVEClipColor.h"
 #import <Foundation/Foundation.h>
 
 #import <AVFoundation/AVFoundation.h>
@@ -114,8 +115,8 @@ static NSDictionary *currentThermalState(void) {
 
 // Defined below, used in `appendVideoFrame` above it.
 static void blendClipIntoFrame(uint8_t *dst, int frameWidth, int frameHeight,
-                               CVPixelBufferRef clip, int rx, int ry, int rw,
-                               int rh, int quarterTurns);
+                               CVPixelBufferRef clip, const FQVEClipColor *color,
+                               int rx, int ry, int rw, int rh, int quarterTurns);
 
 /// One clip, decoded forward, holding the frame that is currently on screen.
 ///
@@ -130,8 +131,54 @@ static void blendClipIntoFrame(uint8_t *dst, int frameWidth, int frameHeight,
 @property(nonatomic) AVAssetReaderTrackOutput *output;
 @property(nonatomic) CVPixelBufferRef current;
 @property(nonatomic) CMTime currentEnd;
+/// How to read this clip's samples. Owned here, freed in `dealloc`.
+@property(nonatomic, assign) FQVEClipColor *color;
 - (instancetype)initWithPath:(NSString *)path reason:(NSString **)reason;
 @end
+
+/// What the track says its colour is, mapped onto the shared enums.
+///
+/// Read from the format description rather than assumed. A file that says
+/// nothing gets Rec.709 above standard definition and Rec.601 below it, which is
+/// what every player assumes — the same fallback, and the same reasoning, as the
+/// Android side. Guessing is unavoidable; guessing silently is not.
+static FQVEClipColor *FQVEClipColorFromTrack(AVAssetTrack *track) {
+    FQVEStandard standard = FQVEStandardBT709;
+    FQVETransfer transfer = FQVETransferSDR;
+
+    CMFormatDescriptionRef desc =
+        (__bridge CMFormatDescriptionRef)track.formatDescriptions.firstObject;
+    if (desc) {
+        CFStringRef matrix = CMFormatDescriptionGetExtension(
+            desc, kCMFormatDescriptionExtension_YCbCrMatrix);
+        if (matrix) {
+            if (CFEqual(matrix, kCMFormatDescriptionYCbCrMatrix_ITU_R_2020)) {
+                standard = FQVEStandardBT2020;
+            } else if (CFEqual(matrix, kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4)) {
+                standard = FQVEStandardBT601;
+            }
+        } else {
+            CGSize size = track.naturalSize;
+            standard = size.height >= 720 ? FQVEStandardBT709 : FQVEStandardBT601;
+        }
+
+        CFStringRef fn = CMFormatDescriptionGetExtension(
+            desc, kCMFormatDescriptionExtension_TransferFunction);
+        if (fn) {
+            if (CFEqual(fn, kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG)) {
+                transfer = FQVETransferHLG;
+            } else if (CFEqual(fn, kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ)) {
+                transfer = FQVETransferPQ;
+            }
+        }
+    }
+
+    // `420YpCbCr10BiPlanarVideoRange` is limited range by its own definition,
+    // which is why that is asked for by name rather than inferred.
+    FQVEClipColor *color = FQVEClipColorCreate(standard, transfer, NO);
+    NSLog(@"FQVE: CLIP color %@", FQVEClipColorDescribe(color));
+    return color;
+}
 
 @implementation FQVEClipReader
 
@@ -172,21 +219,26 @@ static void blendClipIntoFrame(uint8_t *dst, int frameWidth, int frameHeight,
         return nil;
     }
 
+    // **Ten-bit YCbCr, and deliberately no `AVVideoColorPropertiesKey`.**
+    // Naming Rec.709 there asked AVFoundation to convert, and it obliged with a
+    // tone map we could not see, match or reproduce — which is why the same clip
+    // came out of an iPhone looking different from the same clip out of a
+    // Galaxy. Taking the samples as the file stores them and converting in
+    // `FQVEClipColor` is what lets both platforms run one arithmetic against one
+    // published method. It is also the same shape Android receives, so the two
+    // are comparable pixel for pixel rather than by eye.
     self.output = [[AVAssetReaderTrackOutput alloc]
         initWithTrack:track
        outputSettings:@{
-           (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-           AVVideoColorPropertiesKey : @{
-               AVVideoColorPrimariesKey : AVVideoColorPrimaries_ITU_R_709_2,
-               AVVideoTransferFunctionKey : AVVideoTransferFunction_ITU_R_709_2,
-               AVVideoYCbCrMatrixKey : AVVideoYCbCrMatrix_ITU_R_709_2,
-           },
+           (id)kCVPixelBufferPixelFormatTypeKey :
+               @(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
        }];
     self.output.alwaysCopiesSampleData = NO;
     if (![self.reader canAddOutput:self.output]) {
-        if (reason) { *reason = @"this device cannot decode it to BGRA"; }
+        if (reason) { *reason = @"this device cannot decode it to 10-bit YCbCr"; }
         return nil;
     }
+    self.color = FQVEClipColorFromTrack(track);
     [self.reader addOutput:self.output];
     if (![self.reader startReading]) {
         if (reason) {
@@ -227,6 +279,7 @@ static void blendClipIntoFrame(uint8_t *dst, int frameWidth, int frameHeight,
 - (void)dealloc {
     if (self.current) { CVPixelBufferRelease(self.current); }
     [self.reader cancelReading];
+    FQVEClipColorRelease(self.color);
 }
 
 @end
@@ -649,6 +702,7 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                         [reader frameAtTime:CMTimeMake(us, 1000000)];
 
                     blendClipIntoFrame(dst, self.width, self.height, clip,
+                                       reader.color,
                                        [hole[@"x"] intValue],
                                        [hole[@"y"] intValue],
                                        [hole[@"w"] intValue],
@@ -1096,17 +1150,22 @@ static void blendClipIntoFrame(uint8_t *dst,
                                int frameWidth,
                                int frameHeight,
                                CVPixelBufferRef clip,
+                               const FQVEClipColor *color,
                                int rx, int ry, int rw, int rh,
                                int quarterTurns)
 {
     if (!clip || rw <= 0 || rh <= 0) { return; }
 
     CVPixelBufferLockBaseAddress(clip, kCVPixelBufferLock_ReadOnly);
-    const uint8_t *src = (const uint8_t *)CVPixelBufferGetBaseAddress(clip);
-    size_t srcStride = CVPixelBufferGetBytesPerRow(clip);
+    const uint16_t *lumaPlane =
+        (const uint16_t *)CVPixelBufferGetBaseAddressOfPlane(clip, 0);
+    const uint16_t *chromaPlane =
+        (const uint16_t *)CVPixelBufferGetBaseAddressOfPlane(clip, 1);
+    size_t lumaStride = CVPixelBufferGetBytesPerRowOfPlane(clip, 0);
+    size_t chromaStride = CVPixelBufferGetBytesPerRowOfPlane(clip, 1);
     int srcW = (int)CVPixelBufferGetWidth(clip);
     int srcH = (int)CVPixelBufferGetHeight(clip);
-    if (!src || srcW <= 0 || srcH <= 0) {
+    if (!lumaPlane || !chromaPlane || !color || srcW <= 0 || srcH <= 0) {
         CVPixelBufferUnlockBaseAddress(clip, kCVPixelBufferLock_ReadOnly);
         return;
     }
@@ -1137,7 +1196,22 @@ static void blendClipIntoFrame(uint8_t *dst,
             if (sx < 0) { sx = 0; } else if (sx >= srcW) { sx = srcW - 1; }
             if (sy < 0) { sy = 0; } else if (sy >= srcH) { sy = srcH - 1; }
 
-            const uint8_t *s = src + (size_t)sy * srcStride + (size_t)sx * 4;
+            // **Ten bits live in the high bits of each 16-bit word**, so the
+            // shift is six rather than nothing. Measured off a real decode
+            // rather than read from a header: the luma of a bright row came back
+            // between 17216 and 56256, which is 269 to 879 once shifted — a
+            // limited-range span. Reading it unshifted would have scaled the
+            // whole clip by sixty-four and looked like a blown exposure.
+            const uint16_t *lumaRow =
+                (const uint16_t *)((const uint8_t *)lumaPlane + (size_t)sy * lumaStride);
+            const uint16_t *chromaRow =
+                (const uint16_t *)((const uint8_t *)chromaPlane
+                                   + (size_t)(sy / 2) * chromaStride);
+            const int yy = lumaRow[sx] >> 6;
+            const int cb = chromaRow[(sx / 2) * 2] >> 6;
+            const int cr = chromaRow[(sx / 2) * 2 + 1] >> 6;
+            const uint32_t rgb = FQVEClipColorToRgb(color, yy, cb, cr);
+
             uint8_t *d = dst + ((size_t)dy * frameWidth + dx) * 4;
 
             // Destination is RGBA **straight**; the clip arrives BGRA.
@@ -1163,9 +1237,9 @@ static void blendClipIntoFrame(uint8_t *dst,
             int a = d[3];
             if (a == 255) { continue; }
             int inv = 255 - a;
-            d[0] = (uint8_t)((d[0] * a + s[2] * inv) / 255);
-            d[1] = (uint8_t)((d[1] * a + s[1] * inv) / 255);
-            d[2] = (uint8_t)((d[2] * a + s[0] * inv) / 255);
+            d[0] = (uint8_t)((d[0] * a + (int)((rgb >> 16) & 0xFF) * inv) / 255);
+            d[1] = (uint8_t)((d[1] * a + (int)((rgb >> 8) & 0xFF) * inv) / 255);
+            d[2] = (uint8_t)((d[2] * a + (int)(rgb & 0xFF) * inv) / 255);
             d[3] = 255;
         }
     }
