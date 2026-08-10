@@ -291,13 +291,51 @@ class FlutterQuickVideoEncoder {
   /// means "this clip has no picture" and must not come to mean "a newer
   /// request overtook you" as well.
   ///
+  /// **That coalescing is the whole pacing policy. Do not put a timer in front
+  /// of it.** Three rules and no constant: with nothing in flight, call
+  /// immediately; with something in flight, keep only the newest waiting
+  /// instant; when a call returns, start the waiting one. The cadence then
+  /// settles at whatever this device decodes at, which is the fastest correct
+  /// answer and needs no tuning per codec or per phone — and the gesture always
+  /// ends on the instant the finger stopped at, because the last move either
+  /// started a decode or is the one still waiting.
+  ///
+  /// **A trailing debounce looks right and cannot work here.** A dragging finger
+  /// emits a move every frame, so the timer resets before it ever expires and
+  /// the preview holds still for the whole gesture. Measured on an iPhone 17 Pro
+  /// Max against a 4K clip: a 21-point drag at ~16 ms spacing produced *two*
+  /// calls, one at the start and one after the finger lifted, and what sat on
+  /// screen in between was a sharp, real frame from a position the handle had
+  /// left 300 ms and eighty seconds of footage earlier. Nothing looks broken,
+  /// which is the whole problem. Debouncing is right for a *discrete* jump — a
+  /// tap on a timeline, a keyboard step — and wrong for a continuous drag, and
+  /// this API cannot tell which one the caller has.
+  ///
+  /// **[maxEdge] is in device pixels.** Passing logical pixels yields a picture
+  /// at a fraction of the resolution it is drawn at, which reads as soft
+  /// *footage* rather than as a soft preview and so tends to be blamed on the
+  /// clip. Multiply by the view's `devicePixelRatio`.
+  ///
   /// **Readers are cached by path and have to be let go explicitly**, see
-  /// [releaseClipPreviews]. Measured on macOS against a 4K HEVC Main10 clip,
-  /// opening the file costs about 250 ms while seeking inside an already-open
-  /// reader costs a fraction of that, so a handle that reopened per call would
-  /// feel stuck. The cache is bounded and separate from the export's, and
-  /// [setup] drops it, so a preview can never be holding the decoder an export
-  /// wants.
+  /// [releaseClipPreviews]. What the cache buys is narrower than it sounds, and
+  /// the numbers are worth knowing before pacing anything around them. Measured
+  /// on macOS, profile, against a 4K HEVC Main10 clip at `maxEdge` 512:
+  ///
+  ///  - cold open and seek — **96–107 ms**
+  ///  - seek on an already-open reader — **74–83 ms**
+  ///  - forward inside the two-second window, no seek — **6 ms**
+  ///  - the same instant again, nothing decoded — **5–10 ms**
+  ///
+  /// So opening the file is worth only about twenty of those milliseconds; the
+  /// rest is decoding forward from the sync sample before the instant, which no
+  /// cache avoids. **What the cache actually buys is the 6 ms case**, and on a
+  /// phone that is a smaller target than it looks: a four-minute clip laid out
+  /// across a few hundred points of slider is a third of a second of footage per
+  /// point, so an ordinary drag leaves the cheap window within a handful of
+  /// points. It is the desk where the fast path pays.
+  ///
+  /// The cache is bounded and separate from the export's, and [setup] drops it,
+  /// so a preview can never be holding the decoder an export wants.
   static Future<ClipPreviewFrame?> clipFrameAt(
     String path,
     Duration at, {
