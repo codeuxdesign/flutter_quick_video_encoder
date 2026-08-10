@@ -1,7 +1,13 @@
 #import "FQVEClipColor.h"
 
+#import <float.h>
 #import <math.h>
 #import <stdlib.h>
+
+// Java never fuses a multiply-add; letting clang fuse one here would let the
+// two platforms drift in the last bit of every float expression, which is
+// exactly the seam the hot-cell flags and the core table are built across.
+#pragma STDC FP_CONTRACT OFF
 
 // Sizes and split point are the Java file's, deliberately. Two implementations
 // of one conversion agree only if they quantise the same way; a table half the
@@ -27,6 +33,16 @@ static const double kLimitedLumaSpan = 876.0;
 static const double kChromaCentre = 512.0;
 static const double kLimitedChromaSpan = 896.0;
 
+// The wide path's 3-D core table, matching the Java side's constants exactly —
+// see `ClipColor` for why the core is the unclamped tone-domain triple, why
+// every clamp lives in the per-pixel epilogue, and why the epilogue reuses the
+// chain's own tables rather than building integer ones of its own.
+static const int kCodes = 1024;
+static const int kChromaCellShift = 6;
+static const int kChromaCellMask = (1 << kChromaCellShift) - 1;
+static const int kChromaNodes = (kCodes >> kChromaCellShift) + 1;
+static const int kToneOne = 4096;
+
 struct FQVEClipColor {
     FQVEStandard standard;
     FQVETransfer transfer;
@@ -44,10 +60,19 @@ struct FQVEClipColor {
     float *gammaEncode24, *gammaDecode24, *lumaToneMap;   // kToneLut
     uint8_t *toSrgbLow, *toSrgbHigh;
 
+    // The smooth core as one table — [luma][cb node][cr node], three shorts
+    // each — plus the hot-cell flags. Same layout, same Q12 scale, same
+    // rounding as the Java side.
+    int16_t *coreLut;
+    uint8_t *wideHot;
+
     float hlgScale;
     float toPeakNormalized;
     float lumaR, lumaG, lumaB;
 };
+
+static void BuildCoreLut(FQVEClipColor *c);
+static uint32_t WideChain(const FQVEClipColor *c, int y, int cb, int cr);
 
 static double HlgSignalToScene(double signal) {
     const double a = 0.17883277;
@@ -175,17 +200,22 @@ FQVEClipColor *FQVEClipColorCreate(FQVEStandard standard,
         c->hlgScale = (float)(1.0 / display);
     }
 
+    // The decode half of the 1/2.4 pair is built for every clip, not just the
+    // tone-mapped ones: the core table's epilogue decodes through it even when
+    // the core is an SDR transfer's linear light re-encoded.
+    c->gammaDecode24 = malloc(sizeof(float) * kToneLut);
+    for (int i = 0; i < kToneLut; i++) {
+        c->gammaDecode24[i] = (float)pow((double)i / (kToneLut - 1), 2.4);
+    }
+
     if (c->compressHighlights) {
         c->toPeakNormalized = transfer == FQVETransferHLG
             ? 1.0f / c->hlgScale
             : (float)(kPqReferenceWhiteNits / kToneMapHdrNits);
 
         c->gammaEncode24 = malloc(sizeof(float) * kToneLut);
-        c->gammaDecode24 = malloc(sizeof(float) * kToneLut);
         for (int i = 0; i < kToneLut; i++) {
-            const double x = (double)i / (kToneLut - 1);
-            c->gammaEncode24[i] = (float)pow(x, 1.0 / 2.4);
-            c->gammaDecode24[i] = (float)pow(x, 2.4);
+            c->gammaEncode24[i] = (float)pow((double)i / (kToneLut - 1), 1.0 / 2.4);
         }
 
         const double rhoHdr = 1.0 + 32.0 * pow(kToneMapHdrNits / 10000.0, 1.0 / 2.4);
@@ -218,6 +248,10 @@ FQVEClipColor *FQVEClipColorCreate(FQVEStandard standard,
         c->toSrgbHigh[i] = (uint8_t)lround(255.0 * SrgbEncode(x));
     }
 
+    if (c->wideGamutOrHdr) {
+        BuildCoreLut(c);
+    }
+
     return c;
 }
 
@@ -228,6 +262,7 @@ void FQVEClipColorRelease(FQVEClipColor *c) {
     free(c->toLinear); free(c->ootfGain);
     free(c->gammaEncode24); free(c->gammaDecode24); free(c->lumaToneMap);
     free(c->toSrgbLow); free(c->toSrgbHigh);
+    free(c->coreLut); free(c->wideHot);
     free(c);
 }
 
@@ -256,6 +291,215 @@ static inline int SrgbByte(const FQVEClipColor *c, float linear) {
     }
     return c->toSrgbHigh[(int)((linear - kEncodeSplit)
         * ((kEncodeHighLut - 1) / (1.0f - kEncodeSplit)) + 0.5f)];
+}
+
+// ---- the wide path's core table -------------------------------------------
+//
+// The design, its measurements and the reasons live with the Java `ClipColor`;
+// this is the same arithmetic in the same order with the same rounding, which
+// is the property the two platforms are held to.
+
+/// floor(x + 0.5) spelled out: lroundf rounds a negative half away from zero,
+/// Java's Math.floor-based rounding toward positive infinity, and an
+/// out-of-gamut node is negative.
+static int16_t ToneShort(float tone) {
+    const float x = tone * (float)kToneOne + 0.5f;
+    int q = (int)floorf(x);
+    if (q < INT16_MIN) { q = INT16_MIN; }
+    if (q > INT16_MAX) { q = INT16_MAX; }
+    return (int16_t)q;
+}
+
+/// The chain's 2.4 gamma decode for a Q12 tone value, clamp included. The
+/// index arithmetic is all-integer and exactly reproduces `Sampled`'s
+/// `(int)(x * 4095 + 0.5f)` for `x = t/4096`.
+static inline float Decode24(const FQVEClipColor *c, int t) {
+    if (t < 0) { t = 0; } else if (t > kToneOne) { t = kToneOne; }
+    return c->gammaDecode24[(t * (kToneLut - 1) + kToneOne / 2) >> 12];
+}
+
+/// The smooth core: signal to unclamped tone-domain R'G'B' — the chain's own
+/// front half, stopping just short of the clamp that belongs to the epilogue.
+static void CoreTone(const FQVEClipColor *c, int y, int cb, int cr, float out[3]) {
+    const float base = c->wY[y];
+    float r = Clamp01(base + c->wRfromV[cr]);
+    float g = Clamp01(base + c->wGfromU[cb] + c->wGfromV[cr]);
+    float b = Clamp01(base + c->wBfromU[cb]);
+
+    r = c->toLinear[(int)(r * (kLinearLut - 1) + 0.5f)];
+    g = c->toLinear[(int)(g * (kLinearLut - 1) + 0.5f)];
+    b = c->toLinear[(int)(b * (kLinearLut - 1) + 0.5f)];
+
+    if (c->transfer == FQVETransferHLG) {
+        float scene = c->lumaR * r + c->lumaG * g + c->lumaB * b;
+        scene = Clamp01(scene);
+        const float gain =
+            c->ootfGain[(int)(scene * (kGainLut - 1) + 0.5f)] * c->hlgScale;
+        r *= gain; g *= gain; b *= gain;
+    }
+
+    if (c->compressHighlights) {
+        const float rp = Sampled(c->gammaEncode24, kToneLut, r * c->toPeakNormalized);
+        const float gp = Sampled(c->gammaEncode24, kToneLut, g * c->toPeakNormalized);
+        const float bp = Sampled(c->gammaEncode24, kToneLut, b * c->toPeakNormalized);
+
+        const float yHdr = 0.2627f * rp + 0.6780f * gp + 0.0593f * bp;
+        const float ySdr = Sampled(c->lumaToneMap, kToneLut, yHdr);
+
+        float chromaB = 0.0f;
+        float chromaR = 0.0f;
+        if (yHdr > 0.0f) {
+            const float f = ySdr / (1.1f * yHdr);
+            chromaB = f * (bp - yHdr) / 1.8814f;
+            chromaR = f * (rp - yHdr) / 1.4746f;
+        }
+        const float yTmo = ySdr - (0.1f * chromaR > 0.0f ? 0.1f * chromaR : 0.0f);
+
+        out[0] = yTmo + 1.4746f * chromaR;
+        out[2] = yTmo + 1.8814f * chromaB;
+        out[1] = yTmo
+            - (0.2627f * 1.4746f / 0.6780f) * chromaR
+            - (0.0593f * 1.8814f / 0.6780f) * chromaB;
+        return;
+    }
+
+    // Wide gamut with an SDR transfer: no tone mapping, so the core is the
+    // linear light lifted into the same 1/2.4 domain the epilogue decodes.
+    out[0] = (float)pow((double)Clamp01(r), 1.0 / 2.4);
+    out[1] = (float)pow((double)Clamp01(g), 1.0 / 2.4);
+    out[2] = (float)pow((double)Clamp01(b), 1.0 / 2.4);
+}
+
+static BOOL Straddles(float a, float b) {
+    const float lo = a < b ? a : b;
+    const float hi = a < b ? b : a;
+    return (lo < 0.0f && hi > 0.0f) || (lo < 1.0f && hi > 1.0f);
+}
+
+static BOOL Straddles4(float a, float b, float cc, float d) {
+    float lo = a, hi = a;
+    if (b < lo) { lo = b; }
+    if (b > hi) { hi = b; }
+    if (cc < lo) { lo = cc; }
+    if (cc > hi) { hi = cc; }
+    if (d < lo) { lo = d; }
+    if (d > hi) { hi = d; }
+    return (lo < 0.0f && hi > 0.0f) || (lo < 1.0f && hi > 1.0f);
+}
+
+/// Whether an output channel crosses black inside this cell — the takeoff at
+/// the Rec.709 gamut edge, where the encode's slope amplifies interpolation
+/// curvature into whole codes.
+static BOOL NearZeroShell(const FQVEClipColor *c, int y, int cu, int cv) {
+    float lo[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
+    float hi[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+    for (int du = 0; du <= 1; du++) {
+        for (int dv = 0; dv <= 1; dv++) {
+            const int i = ((y * kChromaNodes + cu + du) * kChromaNodes
+                           + cv + dv) * 3;
+            float r = Decode24(c, c->coreLut[i]);
+            float g = Decode24(c, c->coreLut[i + 1]);
+            float b = Decode24(c, c->coreLut[i + 2]);
+            if (c->standard == FQVEStandardBT2020) {
+                const float lr = r, lg = g, lb = b;
+                r =  1.660491f * lr - 0.587641f * lg - 0.072850f * lb;
+                g = -0.124550f * lr + 1.132900f * lg - 0.008350f * lb;
+                b = -0.018151f * lr - 0.100579f * lg + 1.118730f * lb;
+            }
+            if (r < lo[0]) { lo[0] = r; }
+            if (r > hi[0]) { hi[0] = r; }
+            if (g < lo[1]) { lo[1] = g; }
+            if (g > hi[1]) { hi[1] = g; }
+            if (b < lo[2]) { lo[2] = b; }
+            if (b > hi[2]) { hi[2] = b; }
+        }
+    }
+    return (lo[0] < 0.0f && hi[0] > 0.0f) || (lo[1] < 0.0f && hi[1] > 0.0f)
+        || (lo[2] < 0.0f && hi[2] > 0.0f);
+}
+
+static void MarkHotCells(FQVEClipColor *c) {
+    const int cells = kCodes >> kChromaCellShift;
+    c->wideHot = calloc(1, kCodes * cells * cells);
+    for (int y = 0; y < kCodes; y++) {
+        const float base = c->wY[y];
+        for (int cu = 0; cu < cells; cu++) {
+            const int u0 = cu << kChromaCellShift;
+            int u1 = u0 + (1 << kChromaCellShift);
+            if (u1 > kCodes - 1) { u1 = kCodes - 1; }
+            for (int cv = 0; cv < cells; cv++) {
+                const int v0 = cv << kChromaCellShift;
+                int v1 = v0 + (1 << kChromaCellShift);
+                if (v1 > kCodes - 1) { v1 = kCodes - 1; }
+                const BOOL kinked =
+                    Straddles(base + c->wRfromV[v0], base + c->wRfromV[v1])
+                    || Straddles(base + c->wBfromU[u0], base + c->wBfromU[u1])
+                    || Straddles4(base + c->wGfromU[u0] + c->wGfromV[v0],
+                                  base + c->wGfromU[u0] + c->wGfromV[v1],
+                                  base + c->wGfromU[u1] + c->wGfromV[v0],
+                                  base + c->wGfromU[u1] + c->wGfromV[v1]);
+                if (kinked || NearZeroShell(c, y, cu, cv)) {
+                    c->wideHot[(y << 8) | (cu << 4) | cv] = 1;
+                }
+            }
+        }
+    }
+}
+
+static void BuildCoreLut(FQVEClipColor *c) {
+    c->coreLut = malloc(sizeof(int16_t) * kCodes * kChromaNodes * kChromaNodes * 3);
+    float tone[3];
+    int at = 0;
+    for (int y = 0; y < kCodes; y++) {
+        for (int cbn = 0; cbn < kChromaNodes; cbn++) {
+            int u = cbn << kChromaCellShift;
+            if (u > kCodes - 1) { u = kCodes - 1; }
+            for (int crn = 0; crn < kChromaNodes; crn++) {
+                int v = crn << kChromaCellShift;
+                if (v > kCodes - 1) { v = kCodes - 1; }
+                CoreTone(c, y, u, v, tone);
+                c->coreLut[at++] = ToneShort(tone[0]);
+                c->coreLut[at++] = ToneShort(tone[1]);
+                c->coreLut[at++] = ToneShort(tone[2]);
+            }
+        }
+    }
+    MarkHotCells(c);
+}
+
+/// Bilinear over the core table, then the exact epilogue — the chain's own
+/// tail, entered through integer index math.
+static uint32_t TablePath(const FQVEClipColor *c, int y, int cb, int cr) {
+    const int ub = cb >> kChromaCellShift;
+    const int uf = cb & kChromaCellMask;
+    const int vb = cr >> kChromaCellShift;
+    const int vf = cr & kChromaCellMask;
+    const int w11 = uf * vf;
+    const int w01 = (vf << kChromaCellShift) - w11;
+    const int w10 = (uf << kChromaCellShift) - w11;
+    const int w00 = kToneOne - w01 - w10 - w11;
+    const int i = ((y * kChromaNodes + ub) * kChromaNodes + vb) * 3;
+    const int j = i + kChromaNodes * 3;
+    const int16_t *lut = c->coreLut;
+    const int tr = (lut[i] * w00 + lut[i + 3] * w01
+                    + lut[j] * w10 + lut[j + 3] * w11 + kToneOne / 2) >> 12;
+    const int tg = (lut[i + 1] * w00 + lut[i + 4] * w01
+                    + lut[j + 1] * w10 + lut[j + 4] * w11 + kToneOne / 2) >> 12;
+    const int tb = (lut[i + 2] * w00 + lut[i + 5] * w01
+                    + lut[j + 2] * w10 + lut[j + 5] * w11 + kToneOne / 2) >> 12;
+
+    float r = Decode24(c, tr);
+    float g = Decode24(c, tg);
+    float b = Decode24(c, tb);
+    if (c->standard == FQVEStandardBT2020) {
+        const float lr = r, lg = g, lb = b;
+        r =  1.660491f * lr - 0.587641f * lg - 0.072850f * lb;
+        g = -0.124550f * lr + 1.132900f * lg - 0.008350f * lb;
+        b = -0.018151f * lr - 0.100579f * lg + 1.118730f * lb;
+    }
+    return ((uint32_t)SrgbByte(c, r) << 16)
+         | ((uint32_t)SrgbByte(c, g) << 8)
+         |  (uint32_t)SrgbByte(c, b);
 }
 
 uint32_t FQVEClipColorToRgb(const FQVEClipColor *c, int y, int cb, int cr) {
@@ -289,6 +533,19 @@ uint32_t FQVEClipColorToRgb(const FQVEClipColor *c, int y, int cb, int cr) {
              |  (uint32_t)ClampByte((base + c->iBfromU[cb]) >> 16);
     }
 
+    // The wide path answers from the core table, except inside the cells the
+    // hot marking flagged — the entry clamp's kinks and the gamut boundary's
+    // takeoff — which take the full chain.
+    if (c->wideHot[(y << 8) | ((cb >> kChromaCellShift) << 4)
+                   | (cr >> kChromaCellShift)]) {
+        return WideChain(c, y, cb, cr);
+    }
+    return TablePath(c, y, cb, cr);
+}
+
+/// The full conversion, evaluated rather than looked up: the original float
+/// arithmetic, unchanged. Per pixel it runs only inside hot cells.
+static uint32_t WideChain(const FQVEClipColor *c, int y, int cb, int cr) {
     const float base = c->wY[y];
     float r = Clamp01(base + c->wRfromV[cr]);
     float g = Clamp01(base + c->wGfromU[cb] + c->wGfromV[cr]);

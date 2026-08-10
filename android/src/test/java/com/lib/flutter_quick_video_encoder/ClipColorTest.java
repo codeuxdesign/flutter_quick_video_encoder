@@ -334,6 +334,58 @@ public class ClipColorTest {
                         + "it at " + expected, Math.abs(converted - expected) <= 2);
     }
 
+    /**
+     * The interpolated table against the chain it stands in for.
+     *
+     * <p>The wide path answers from a 3-D table — exact per luma code,
+     * bilinear across chroma, with the clamps evaluated per pixel after
+     * interpolation and the kinked cells falling back to the chain itself.
+     * This walks a lattice over the legal broadcast range and bounds the
+     * disagreement: the worst measured is nine codes, at chroma past ninety
+     * percent saturation, and the neutral axis — where every accuracy test
+     * above lives — never strays past a single code of fixed-point rounding.
+     * A change that coarsens the table, breaks the hot-cell marking, or
+     * misindexes a node moves these numbers by tens, not fractions.
+     */
+    @Test
+    public void theWideTableAgreesWithTheChain() {
+        final ClipColor hlg =
+                new ClipColor(ClipColor.STANDARD_BT2020, ClipColor.TRANSFER_HLG, false);
+
+        int worst = 0;
+        long sum = 0;
+        long count = 0;
+        for (int y = 64; y <= 940; y += 13) {
+            for (int u = 64; u <= 960; u += 11) {
+                for (int v = 64; v <= 960; v += 11) {
+                    final int a = hlg.toRgb(y, u, v);
+                    final int b = hlg.wideChain(y, u, v);
+                    for (int shift = 0; shift <= 16; shift += 8) {
+                        final int d = Math.abs(((a >> shift) & 0xFF)
+                                - ((b >> shift) & 0xFF));
+                        sum += d;
+                        count++;
+                        if (d > worst) {
+                            worst = d;
+                        }
+                    }
+                }
+            }
+        }
+        assertTrue("table strays " + worst + " codes from the chain", worst <= 9);
+        assertTrue("mean disagreement " + (sum / (double) count),
+                sum < count);
+
+        for (int y = 64; y <= 940; y++) {
+            final int a = hlg.toRgb(y, NEUTRAL, NEUTRAL);
+            final int b = hlg.wideChain(y, NEUTRAL, NEUTRAL);
+            for (int shift = 0; shift <= 16; shift += 8) {
+                final int d = Math.abs(((a >> shift) & 0xFF) - ((b >> shift) & 0xFF));
+                assertTrue("neutral luma " + y + " strays " + d + " codes", d <= 1);
+            }
+        }
+    }
+
     @Test
     public void anSdrRec709ClipTakesTheIntegerPath() {
         assertTrue(new ClipColor(ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, false)

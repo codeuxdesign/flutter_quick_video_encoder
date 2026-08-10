@@ -144,6 +144,77 @@ final class ClipColor {
      */
     static final int CODES = 1024;
 
+    /**
+     * The wide path split in two: an interpolated core and an exact epilogue.
+     *
+     * <p><b>Why a table rather than a faster chain.</b> The chain behind
+     * {@link #wideChain} is fourteen 1-D lookups and some forty float
+     * operations per pixel, and none of them is individually wasteful — the
+     * plane copy was rewritten and moved nothing, and shaving constants here
+     * was headed the same way. What is wasteful is running the whole of it two
+     * million times a frame when its three inputs are ten-bit codes: most of
+     * the function fits in a table built once per clip.
+     *
+     * <p><b>Most, not all, because clamps are not smooth.</b> The first design
+     * tabulated the finished sRGB bytes, and on a real drone frame it missed
+     * by up to 22 codes with a mean of 2.9: wherever a channel saturates —
+     * and at HLG's bright end most cells hold a saturation boundary, because
+     * the inverse OETF is an exponential and one 64-code chroma cell spans
+     * two and a half times of linear light — the finished output has a slope
+     * kink, and a straight line across a kink overshoots. No affordable grid
+     * fixes that: the worst kink slope measured ~6 output codes per input
+     * code, which would need cells a single code wide.
+     *
+     * <p>So the table stores the chain's <em>smooth core</em> instead: the
+     * unclamped tone-domain triple (the report's R', G', B' after Table 3),
+     * which no clamp has touched yet. Every clamp lives in the epilogue —
+     * clamp to [0,1], the 2.4 gamma decode, the BT.2020 to Rec.709 matrix,
+     * the sRGB encode — and the epilogue runs per pixel, exactly: it is the
+     * chain's own tail, reading the chain's own tables, entered through
+     * integer index math. A clamp applied after interpolation cannot kink
+     * the interpolant.
+     * For a wide-gamut source with an SDR transfer there is no tone mapping;
+     * its core is the same triple in the same 1/2.4 domain, taken just before
+     * the matrix, so one epilogue serves both.
+     *
+     * <p><b>Exact per luma code, interpolated across chroma.</b> Luma carries
+     * the nonlinearity — the transfer function, the OOTF, the tone map's knee
+     * — and it is the axis the accuracy tests walk code by code, so it gets
+     * all 1024 rows and no interpolation error. Chroma is interpolated
+     * bilinearly between nodes every 64 codes. Neutral chroma, 512, lands
+     * exactly on a node, which keeps a gray card as close to the chain as the
+     * epilogue's fixed point can carry it — within a code.
+     *
+     * <p>1024 x 17 x 17 nodes of three shorts is 1.8 MB per wide-gamut clip —
+     * beside the 25 MB the decoded frame itself holds, and freed with the
+     * reader.
+     */
+    private static final int CHROMA_CELL_SHIFT = 6;
+    private static final int CHROMA_CELL_MASK = (1 << CHROMA_CELL_SHIFT) - 1;
+    private static final int CHROMA_NODES = (CODES >> CHROMA_CELL_SHIFT) + 1;
+
+    /**
+     * The core's fixed-point scale: tone values in twelve fractional bits.
+     *
+     * <p>Twelve because the output byte moves at most ~280 codes per tone
+     * unit, so a step of 1/4096 is under a tenth of a code — and because a
+     * node has to fit a short with headroom, the unclamped tone triple having
+     * no ceiling of its own.
+     *
+     * <p>The epilogue deliberately builds no tables of its own: it reads the
+     * chain's {@code gammaDecode24}, multiplies by the chain's matrix
+     * literals and encodes through the chain's {@code srgbByte}. The first
+     * version had an all-integer epilogue with freshly built tables, and it
+     * cost cross-platform agreement: {@code Math.pow} here and {@code pow} in
+     * libm differ by an ulp on some inputs, and an integer table bakes that
+     * ulp into a full output code at every entry it flips — measured at three
+     * percent of a dense lattice disagreeing with the Apple port, against 22
+     * points in 2.7 million for the float chain. Reusing the chain's own
+     * tables keeps the new path inside the divergence class the platforms
+     * already had.
+     */
+    private static final int TONE_ONE = 4096;
+
     /** 10-bit limited range: luma 64..940, chroma centred on 512 with 896 of swing. */
     private static final double CODE_MAX = 1023.0;
     private static final double LIMITED_LUMA_OFFSET = 64.0;
@@ -173,6 +244,10 @@ final class ClipColor {
     private float[] gammaDecode24;
     /** The luma tone map of §4.1 steps 1 to 3, collapsed into one curve as the report allows. */
     private float[] lumaToneMap;
+    /** The smooth core as one table: [luma][cb node][cr node], three shorts each. */
+    private short[] coreLut;
+    /** One flag per chroma cell per luma row: interpolation misleads here. */
+    private byte[] wideHot;
     /** Scales display-linear so 1.0 means the 1 000 cd/m2 the report assumes. */
     private float toPeakNormalized;
     private float hlgScale;
@@ -230,7 +305,173 @@ final class ClipColor {
 
         if (wideGamutOrHdr) {
             buildWidePath(kr, kg, kb, yScale, yOffset, cScale, rv, bu, gv, gu);
+            buildCoreLut();
         }
+    }
+
+    /**
+     * Samples the smooth core at every luma code and every 64th chroma code.
+     *
+     * <p>The core values come from the same float arithmetic as
+     * {@link #wideChain}'s front half, so on the grid — which includes the
+     * whole neutral axis the accuracy tests walk — the only thing this change
+     * adds is the epilogue's fixed point, under a quarter of a code. The
+     * Apple port builds its table from its own line-for-line copy of the same
+     * arithmetic, which is what keeps the two platforms byte-identical
+     * through this change.
+     */
+    private void buildCoreLut() {
+        coreLut = new short[CODES * CHROMA_NODES * CHROMA_NODES * 3];
+        final float[] tone = new float[3];
+        int at = 0;
+        for (int y = 0; y < CODES; y++) {
+            for (int cb = 0; cb < CHROMA_NODES; cb++) {
+                // The last node would sit at code 1024; the chain's tables stop
+                // at 1023. Clamping shortens the top cell by one code, which
+                // shows up as at most a sixty-fourth of a code's slope.
+                final int u = Math.min(cb << CHROMA_CELL_SHIFT, CODES - 1);
+                for (int cr = 0; cr < CHROMA_NODES; cr++) {
+                    final int v = Math.min(cr << CHROMA_CELL_SHIFT, CODES - 1);
+                    coreTone(y, u, v, tone);
+                    coreLut[at++] = toneShort(tone[0]);
+                    coreLut[at++] = toneShort(tone[1]);
+                    coreLut[at++] = toneShort(tone[2]);
+                }
+            }
+        }
+        markHotCells();
+    }
+
+    /**
+     * Flags every cell where interpolation cannot stand in for the chain.
+     *
+     * <p>Two shapes of failure, measured before they were understood. First,
+     * the one clamp that cannot move into the epilogue: {@code clamp01} on
+     * the signal before the transfer function, whose result everything
+     * downstream — including the cross-channel scene luminance — consumes.
+     * It kinked the interpolant by 43 codes where a bright signal crossed 1.0
+     * mid-cell. Second, no kink at all: near the gamut boundary an output
+     * channel sits close to zero, where the sRGB encode's slope is steepest,
+     * and it amplified a half-percent of smooth interpolation curvature into
+     * 28 codes where red lifts off from black. A finer grid buys almost
+     * nothing against either — the first is a slope discontinuity and the
+     * second a two-hundredfold amplification — so both fall back to the
+     * chain.
+     *
+     * <p>Marked analytically, not by probing. A probing pass was tried and
+     * could not certify a cell: with the amplification at thousands of codes
+     * per tone unit, the error swings from zero to 25 codes between probe
+     * points sixteen codes apart. The analytic conditions are decidable from
+     * the corners alone — the pre-clamp signals are <em>linear</em> in the
+     * chroma pair, so straddling a clamp bound shows at the corners, and the
+     * near-zero shell is read off the corner nodes' own epilogue. The dense
+     * sweep in the commit message is what says the two conditions are the
+     * whole list.
+     *
+     * <p>On the corpus drone frame — a dawn sky that leans on the gamut
+     * boundary — the flagged cells hold about a quarter of the pixels, which
+     * still leaves the frame twice as fast as the chain everywhere; frames
+     * that stay inside the gamut stay entirely on the fast path.
+     */
+    private void markHotCells() {
+        final int cells = CODES >> CHROMA_CELL_SHIFT;
+        wideHot = new byte[CODES * cells * cells];
+        for (int y = 0; y < CODES; y++) {
+            final float base = wY[y];
+            for (int cu = 0; cu < cells; cu++) {
+                final int u0 = cu << CHROMA_CELL_SHIFT;
+                final int u1 = Math.min(u0 + (1 << CHROMA_CELL_SHIFT), CODES - 1);
+                for (int cv = 0; cv < cells; cv++) {
+                    final int v0 = cv << CHROMA_CELL_SHIFT;
+                    final int v1 = Math.min(v0 + (1 << CHROMA_CELL_SHIFT), CODES - 1);
+                    final boolean kinked = straddles(
+                            base + wRfromV[v0], base + wRfromV[v1])
+                            || straddles(base + wBfromU[u0], base + wBfromU[u1])
+                            || straddles4(
+                            base + wGfromU[u0] + wGfromV[v0],
+                            base + wGfromU[u0] + wGfromV[v1],
+                            base + wGfromU[u1] + wGfromV[v0],
+                            base + wGfromU[u1] + wGfromV[v1]);
+                    if (kinked || nearZeroShell(y, cu, cv)) {
+                        wideHot[(y << 8) | (cu << 4) | cv] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Whether an output channel crosses black inside this cell.
+     *
+     * <p>Read off the corner nodes' own epilogue: the channel's post-matrix
+     * linear values straddle zero. That is the takeoff — where red lifts off
+     * from black at the edge of the Rec.709 gamut — and it is where the sRGB
+     * encode's slope is steepest, so the same half-percent of interpolation
+     * curvature that is invisible in a sky was measured at 25 codes here.
+     * Away from the crossing the slope falls off fast: on the corpus drone
+     * frame the residual is four codes at worst, and the dense sweep's worst
+     * is nine — at chroma past ninety percent saturation, colors no camera
+     * emits. Widening the shell to cover those was tried and rejected: it
+     * bought one code and doubled the pixels paying full price.
+     */
+    private boolean nearZeroShell(int y, int cu, int cv) {
+        float lo0 = Float.MAX_VALUE;
+        float hi0 = -Float.MAX_VALUE;
+        float lo1 = Float.MAX_VALUE;
+        float hi1 = -Float.MAX_VALUE;
+        float lo2 = Float.MAX_VALUE;
+        float hi2 = -Float.MAX_VALUE;
+        for (int du = 0; du <= 1; du++) {
+            for (int dv = 0; dv <= 1; dv++) {
+                final int i = ((y * CHROMA_NODES + cu + du) * CHROMA_NODES
+                        + cv + dv) * 3;
+                float r = decode24(coreLut[i]);
+                float g = decode24(coreLut[i + 1]);
+                float b = decode24(coreLut[i + 2]);
+                if (standard == STANDARD_BT2020) {
+                    final float lr = r;
+                    final float lg = g;
+                    final float lb = b;
+                    r = 1.660491f * lr - 0.587641f * lg - 0.072850f * lb;
+                    g = -0.124550f * lr + 1.132900f * lg - 0.008350f * lb;
+                    b = -0.018151f * lr - 0.100579f * lg + 1.118730f * lb;
+                }
+                lo0 = Math.min(lo0, r);
+                hi0 = Math.max(hi0, r);
+                lo1 = Math.min(lo1, g);
+                hi1 = Math.max(hi1, g);
+                lo2 = Math.min(lo2, b);
+                hi2 = Math.max(hi2, b);
+            }
+        }
+        return (lo0 < 0.0f && hi0 > 0.0f) || (lo1 < 0.0f && hi1 > 0.0f)
+                || (lo2 < 0.0f && hi2 > 0.0f);
+    }
+
+    /** Whether [a]..[b] crosses either clamp bound with both sides inside the cell. */
+    private static boolean straddles(float a, float b) {
+        final float lo = Math.min(a, b);
+        final float hi = Math.max(a, b);
+        return (lo < 0.0f && hi > 0.0f) || (lo < 1.0f && hi > 1.0f);
+    }
+
+    private static boolean straddles4(float a, float b, float c, float d) {
+        final float lo = Math.min(Math.min(a, b), Math.min(c, d));
+        final float hi = Math.max(Math.max(a, b), Math.max(c, d));
+        return (lo < 0.0f && hi > 0.0f) || (lo < 1.0f && hi > 1.0f);
+    }
+
+    private static short toneShort(float tone) {
+        // floor(x + 0.5), not Math.round-vs-lroundf: those two disagree on
+        // negative halves, and an out-of-gamut node is negative.
+        final int q = (int) Math.floor(tone * TONE_ONE + 0.5f);
+        if (q < Short.MIN_VALUE) {
+            return Short.MIN_VALUE;
+        }
+        if (q > Short.MAX_VALUE) {
+            return Short.MAX_VALUE;
+        }
+        return (short) q;
     }
 
     private void buildWidePath(double kr, double kg, double kb,
@@ -278,6 +519,14 @@ final class ClipColor {
             hlgScale = (float) (1.0 / display);
         }
 
+        // The decode half of the 1/2.4 pair is built for every wide path, not
+        // just the tone-mapped ones: the table epilogue decodes through it
+        // even when the core is an SDR transfer's linear light re-encoded.
+        gammaDecode24 = new float[TONE_LUT];
+        for (int i = 0; i < TONE_LUT; i++) {
+            gammaDecode24[i] = (float) Math.pow((double) i / (TONE_LUT - 1), 2.4);
+        }
+
         if (compressHighlights) {
             buildToneMap();
         }
@@ -307,7 +556,149 @@ final class ClipColor {
         return toRgbWide(y, u, v);
     }
 
+    /**
+     * The wide path per pixel: bilinear over the core table, then the exact
+     * epilogue — twelve short loads and integer weights for the core, then
+     * the chain's own tail. This is where the 200 ms a frame went: not into
+     * any one step of {@link #wideChain} but into running all of them per
+     * pixel. The hot cells — the entry clamp's kinks and the gamut
+     * boundary's takeoff — still take the chain, because there a straight
+     * line would lie by tens of codes.
+     */
     private int toRgbWide(int y, int u, int v) {
+        if (wideHot[(y << 8) | ((u >> CHROMA_CELL_SHIFT) << 4)
+                | (v >> CHROMA_CELL_SHIFT)] != 0) {
+            return wideChain(y, u, v);
+        }
+        return tablePath(y, u, v);
+    }
+
+    /** Bilinear over the core table, then the exact epilogue. */
+    private int tablePath(int y, int u, int v) {
+        final int ub = u >> CHROMA_CELL_SHIFT;
+        final int uf = u & CHROMA_CELL_MASK;
+        final int vb = v >> CHROMA_CELL_SHIFT;
+        final int vf = v & CHROMA_CELL_MASK;
+        // (64-uf)(64-vf), (64-uf)vf, uf(64-vf), uf*vf — summing to 4096, so
+        // the interpolated tone keeps the nodes' Q12 scale.
+        final int w11 = uf * vf;
+        final int w01 = (vf << CHROMA_CELL_SHIFT) - w11;
+        final int w10 = (uf << CHROMA_CELL_SHIFT) - w11;
+        final int w00 = TONE_ONE - w01 - w10 - w11;
+        final int i = ((y * CHROMA_NODES + ub) * CHROMA_NODES + vb) * 3;
+        final int j = i + CHROMA_NODES * 3;
+        final int tr = (coreLut[i] * w00 + coreLut[i + 3] * w01
+                + coreLut[j] * w10 + coreLut[j + 3] * w11 + TONE_ONE / 2) >> 12;
+        final int tg = (coreLut[i + 1] * w00 + coreLut[i + 4] * w01
+                + coreLut[j + 1] * w10 + coreLut[j + 4] * w11 + TONE_ONE / 2) >> 12;
+        final int tb = (coreLut[i + 2] * w00 + coreLut[i + 5] * w01
+                + coreLut[j + 2] * w10 + coreLut[j + 5] * w11 + TONE_ONE / 2) >> 12;
+
+        // The epilogue: every clamp in the conversion lives below this line,
+        // applied to the interpolated value rather than baked into the nodes,
+        // so no clamp ever kinks what the bilinear above has to represent.
+        // It is the chain's own tail — its decode table, its matrix literals,
+        // its encode — so the only arithmetic this path adds is integer.
+        float r = decode24(tr);
+        float g = decode24(tg);
+        float b = decode24(tb);
+        if (standard == STANDARD_BT2020) {
+            final float lr = r;
+            final float lg = g;
+            final float lb = b;
+            r = 1.660491f * lr - 0.587641f * lg - 0.072850f * lb;
+            g = -0.124550f * lr + 1.132900f * lg - 0.008350f * lb;
+            b = -0.018151f * lr - 0.100579f * lg + 1.118730f * lb;
+        }
+        return (srgbByte(r) << 16) | (srgbByte(g) << 8) | srgbByte(b);
+    }
+
+    /**
+     * The chain's 2.4 gamma decode for a Q12 tone value, clamp included.
+     *
+     * <p>The index arithmetic is all-integer and exactly reproduces
+     * {@code sampled}'s {@code (int) (x * 4095 + 0.5f)} for {@code x = t/4096}:
+     * {@code t*4095/4096 + 1/2} floors to {@code (t*4095 + 2048) >> 12}.
+     */
+    private float decode24(int t) {
+        if (t < 0) {
+            t = 0;
+        } else if (t > TONE_ONE) {
+            t = TONE_ONE;
+        }
+        return gammaDecode24[(t * (TONE_LUT - 1) + TONE_ONE / 2) >> 12];
+    }
+
+    /**
+     * The smooth core: signal to unclamped tone-domain R'G'B', the same float
+     * arithmetic as {@link #wideChain}'s front half. Runs only while
+     * {@link #buildCoreLut} samples it.
+     */
+    private void coreTone(int y, int u, int v, float[] out) {
+        final float base = wY[y];
+        float r = clamp01(base + wRfromV[v]);
+        float g = clamp01(base + wGfromU[u] + wGfromV[v]);
+        float b = clamp01(base + wBfromU[u]);
+
+        r = toLinear[(int) (r * (LINEAR_LUT - 1) + 0.5f)];
+        g = toLinear[(int) (g * (LINEAR_LUT - 1) + 0.5f)];
+        b = toLinear[(int) (b * (LINEAR_LUT - 1) + 0.5f)];
+
+        if (transfer == TRANSFER_HLG) {
+            float scene = lumaR * r + lumaG * g + lumaB * b;
+            if (scene > 1.0f) {
+                scene = 1.0f;
+            } else if (scene < 0.0f) {
+                scene = 0.0f;
+            }
+            final float gain = ootfGain[(int) (scene * (GAIN_LUT - 1) + 0.5f)] * hlgScale;
+            r *= gain;
+            g *= gain;
+            b *= gain;
+        }
+
+        if (compressHighlights) {
+            // Report ITU-R BT.2446-1 §4.1, Tables 2 and 3, stopping just short
+            // of Table 3's final clamp — that belongs to the epilogue.
+            final float rp = sampled(gammaEncode24, r * toPeakNormalized);
+            final float gp = sampled(gammaEncode24, g * toPeakNormalized);
+            final float bp = sampled(gammaEncode24, b * toPeakNormalized);
+
+            final float yHdr = 0.2627f * rp + 0.6780f * gp + 0.0593f * bp;
+            final float ySdr = sampled(lumaToneMap, yHdr);
+
+            float cb = 0.0f;
+            float cr = 0.0f;
+            if (yHdr > 0.0f) {
+                final float f = ySdr / (1.1f * yHdr);
+                cb = f * (bp - yHdr) / 1.8814f;
+                cr = f * (rp - yHdr) / 1.4746f;
+            }
+            final float yTmo = ySdr - Math.max(0.1f * cr, 0.0f);
+
+            out[0] = yTmo + 1.4746f * cr;
+            out[2] = yTmo + 1.8814f * cb;
+            out[1] = yTmo
+                    - (0.2627f * 1.4746f / 0.6780f) * cr
+                    - (0.0593f * 1.8814f / 0.6780f) * cb;
+            return;
+        }
+
+        // Wide gamut with an SDR transfer: no tone mapping, so the core is the
+        // linear light lifted into the same 1/2.4 domain the epilogue decodes
+        // from. The roundtrip costs under a quarter of a code.
+        out[0] = (float) Math.pow(clamp01(r), 1.0 / 2.4);
+        out[1] = (float) Math.pow(clamp01(g), 1.0 / 2.4);
+        out[2] = (float) Math.pow(clamp01(b), 1.0 / 2.4);
+    }
+
+    /**
+     * The full conversion, evaluated rather than looked up: the original
+     * arithmetic, unchanged. Per pixel it runs only inside cells the entry
+     * clamp kinks; everywhere else it is the reference {@code ClipColorTest}
+     * holds the table path against. Package visible for exactly that test.
+     */
+    int wideChain(int y, int u, int v) {
         final float base = wY[y];
         float r = clamp01(base + wRfromV[v]);
         float g = clamp01(base + wGfromU[u] + wGfromV[v]);
@@ -416,11 +807,8 @@ final class ClipColor {
                 : (float) (PQ_REFERENCE_WHITE_NITS / TONE_MAP_HDR_NITS);
 
         gammaEncode24 = new float[TONE_LUT];
-        gammaDecode24 = new float[TONE_LUT];
         for (int i = 0; i < TONE_LUT; i++) {
-            final double x = (double) i / (TONE_LUT - 1);
-            gammaEncode24[i] = (float) Math.pow(x, 1.0 / 2.4);
-            gammaDecode24[i] = (float) Math.pow(x, 2.4);
+            gammaEncode24[i] = (float) Math.pow((double) i / (TONE_LUT - 1), 1.0 / 2.4);
         }
 
         final double rhoHdr =
