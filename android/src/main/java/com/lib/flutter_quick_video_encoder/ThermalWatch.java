@@ -220,6 +220,32 @@ final class ThermalWatch {
     }
 
     /**
+     * The platform's status on a scale both platforms share, 0 to 3.
+     *
+     * <p><b>Normalized here rather than in Dart, and this is the whole point.</b>
+     * Android reports seven states with a headroom float; iOS reports four with
+     * none. A `PERF` row carrying `thermal=MODERATE(2)/0.88` on one and
+     * `thermal=fair` on the other is two rows that still cannot be compared —
+     * which is the exact failure a thermal column exists to prevent, reappearing
+     * one level up. The mapping knowledge lives in the platform layer, so the
+     * translation belongs here too.
+     *
+     * <p>0 nothing, 1 mild and normal under sustained load, 2 limiting enough to
+     * see in a frame time, 3 limiting hard. Android's SEVERE and everything past
+     * it collapse into 3, because a rider does not need seven words for "slower"
+     * and the distinctions above SEVERE are about shutting down, not rendering.
+     */
+    static int level(int status) {
+        if (status < 0) {
+            return -1;
+        }
+        if (status >= PowerManager.THERMAL_STATUS_SEVERE) {
+            return 3;
+        }
+        return status;
+    }
+
+    /**
      * Whether [status] is one a render should tell the rider about.
      *
      * <p>`LIGHT` is normal under sustained load and says nothing useful.

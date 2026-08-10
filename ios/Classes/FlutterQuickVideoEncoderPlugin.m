@@ -19,6 +19,42 @@ CMSampleBufferRef createAudioSampleBuffer(int fps, int audioFrameIdx, int audioC
 
 @class FQVEClipReader;
 
+/// This device's thermal state, on a scale both platforms share.
+///
+/// **The normalization is the point, not the reading.** Apple reports four
+/// states and no headroom; Android reports seven and a float. A `PERF` row
+/// carrying `thermal=fair` beside one carrying `thermal=MODERATE(2)/0.88` is
+/// two rows that still cannot be compared — which is the exact failure a
+/// thermal column exists to prevent, reappearing one level up. So `level` is
+/// 0..3 and means the same thing on both, and `name` keeps the platform's own
+/// word for a human reading a log.
+///
+/// `headroom` is deliberately **absent** here rather than invented: Android can
+/// forecast how close it is to the threshold and Apple cannot, and a gauge
+/// showing a made-up number cannot be unseen. Same shape as `Relief.none`
+/// against an optional library — the absence is named rather than faked.
+///
+/// Serious is where a rider is told, matching Android's MODERATE. Fair happens
+/// under any sustained load, and warning about it would only teach people to
+/// ignore the warning.
+static NSDictionary *currentThermalState(void) {
+    NSProcessInfoThermalState state = [[NSProcessInfo processInfo] thermalState];
+    int level;
+    NSString *name;
+    switch (state) {
+        case NSProcessInfoThermalStateNominal:  level = 0; name = @"nominal";  break;
+        case NSProcessInfoThermalStateFair:     level = 1; name = @"fair";     break;
+        case NSProcessInfoThermalStateSerious:  level = 2; name = @"serious";  break;
+        case NSProcessInfoThermalStateCritical: level = 3; name = @"critical"; break;
+        default:                                level = -1; name = @"unknown"; break;
+    }
+    return @{
+        @"level" : @(level),
+        @"name" : name,
+        @"throttling" : @(level >= 2),
+    };
+}
+
 // Defined below, used in `appendVideoFrame` above it.
 static void blendClipIntoFrame(uint8_t *dst, int frameWidth, int frameHeight,
                                CVPixelBufferRef clip, int rx, int ry, int rw,
@@ -137,6 +173,11 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
 /// Seeking per frame would re-open a decode session for each of them, which on
 /// a 4K HEVC file is the difference between three milliseconds and forty.
 @property(nonatomic) NSMutableDictionary<NSString *, FQVEClipReader *> *mClipReaders;
+
+/// The last thermal level reported, so only transitions are logged. Starts nil,
+/// which no level equals, so the first frame always states where it began.
+@property(nonatomic) NSNumber *mThermalLevel;
+@property(nonatomic) NSString *mThermalName;
 @property(nonatomic) int sampleRate;
 @end
 
@@ -165,7 +206,11 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             NSLog(@"handleMethodCall: %@", call.method);
         }
 
-        if ([@"setLogLevel" isEqualToString:call.method])
+        if ([@"thermalStatus" isEqualToString:call.method])
+        {
+            result(currentThermalState());
+        }
+        else if ([@"setLogLevel" isEqualToString:call.method])
         {
             NSDictionary *args = (NSDictionary*)call.arguments;
             NSNumber *nLogLevel  = args[@"log_level"];
@@ -324,6 +369,26 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             NSData *videoFrameData = rawRgbaData.data;
             if (!self.mClipReaders) {
                 self.mClipReaders = [NSMutableDictionary dictionary];
+            }
+
+            // Say when the device starts throttling, so a render that slows
+            // down has a reason attached rather than being a number nobody can
+            // account for. Measured on Android: a film came back 11 ms/frame
+            // slower than the same film and the difference was the phone's
+            // temperature, not the code.
+            //
+            // On the transition rather than on a timer — the moment it changes
+            // is the fact that explains the slowdown, and a periodic sample
+            // would place it up to its own interval away from where it
+            // happened. `thermalState` is a cheap property read here, unlike
+            // Android's binder call, so per-frame costs nothing.
+            NSNumber *thermalLevel = currentThermalState()[@"level"];
+            if (![thermalLevel isEqualToNumber:self.mThermalLevel]) {
+                NSLog(@"THERMAL %@ frame=%d (was %@)",
+                      currentThermalState()[@"name"], self.videoFrameIdx,
+                      self.mThermalName ?: @"-");
+                self.mThermalLevel = thermalLevel;
+                self.mThermalName = currentThermalState()[@"name"];
             }
 
             // Check if the asset writer is initialized

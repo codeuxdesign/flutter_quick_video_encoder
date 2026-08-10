@@ -350,6 +350,12 @@ public class FlutterQuickVideoEncoderPlugin implements
                     // and saying so would only train people to ignore it.
                     Map<String, Object> thermal = new java.util.LinkedHashMap<>();
                     int status = mThermal == null ? -1 : mThermal.currentStatus();
+                    // `level` is the cross-platform one, 0..3, and the only
+                    // field two rows from different platforms may be compared
+                    // on. `name` and `status` are this platform's own words,
+                    // for a log a human reads rather than a column a script
+                    // does.
+                    thermal.put("level", ThermalWatch.level(status));
                     thermal.put("status", status);
                     thermal.put("name", ThermalWatch.describe(status));
                     thermal.put("throttling", ThermalWatch.worthReporting(status));

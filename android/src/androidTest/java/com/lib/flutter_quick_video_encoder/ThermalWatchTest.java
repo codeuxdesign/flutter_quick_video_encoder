@@ -62,6 +62,39 @@ public class ThermalWatchTest {
         assertFalse(ThermalWatch.worthReporting(-1));
     }
 
+    /**
+     * The scale both platforms share, and the only field a `PERF` row from an
+     * iPhone and one from a Galaxy may be compared on.
+     *
+     * <p>Apple reports four states, Android seven. The iOS side maps
+     * nominal/fair/serious/critical to 0/1/2/3; these have to agree with it or
+     * the column is worse than no column, because it would look comparable
+     * while not being so.
+     */
+    @Test
+    public void theLevelScaleMatchesTheOneIosReports() {
+        assertEquals("nominal", 0, ThermalWatch.level(PowerManager.THERMAL_STATUS_NONE));
+        assertEquals("fair", 1, ThermalWatch.level(PowerManager.THERMAL_STATUS_LIGHT));
+        assertEquals("serious", 2, ThermalWatch.level(PowerManager.THERMAL_STATUS_MODERATE));
+        assertEquals("critical", 3, ThermalWatch.level(PowerManager.THERMAL_STATUS_SEVERE));
+        // Everything past SEVERE is about shutting down rather than rendering,
+        // and a rider does not need seven words for "slower".
+        assertEquals(3, ThermalWatch.level(PowerManager.THERMAL_STATUS_CRITICAL));
+        assertEquals(3, ThermalWatch.level(PowerManager.THERMAL_STATUS_EMERGENCY));
+        assertEquals(3, ThermalWatch.level(PowerManager.THERMAL_STATUS_SHUTDOWN));
+        // Unknown stays unknown rather than collapsing to "fine".
+        assertEquals(-1, ThermalWatch.level(-1));
+    }
+
+    /** The threshold and the scale have to agree, or one of them is lying. */
+    @Test
+    public void theReportingThresholdSitsAtLevelTwo() {
+        for (int status = 0; status <= PowerManager.THERMAL_STATUS_SHUTDOWN; status++) {
+            assertEquals("status " + status,
+                    ThermalWatch.level(status) >= 2, ThermalWatch.worthReporting(status));
+        }
+    }
+
     @Test
     public void everyStatusNamesItself() {
         assertEquals("NONE(0)",
