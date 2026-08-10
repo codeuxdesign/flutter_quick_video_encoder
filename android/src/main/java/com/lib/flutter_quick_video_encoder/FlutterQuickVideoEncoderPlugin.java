@@ -173,6 +173,18 @@ public class FlutterQuickVideoEncoderPlugin implements
                         videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
                         videoFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat);
                         videoFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+                        // Say which matrix the samples were written with, rather
+                        // than letting the player infer one from the frame size.
+                        // `FrameYuv` uses Rec.709 limited range; the draft target
+                        // is 540x960, which is under the 720-line boundary where
+                        // some players switch their default to Rec.601, so the
+                        // inference and the truth would disagree.
+                        videoFormat.setInteger(MediaFormat.KEY_COLOR_STANDARD,
+                                MediaFormat.COLOR_STANDARD_BT709);
+                        videoFormat.setInteger(MediaFormat.KEY_COLOR_RANGE,
+                                MediaFormat.COLOR_RANGE_LIMITED);
+                        videoFormat.setInteger(MediaFormat.KEY_COLOR_TRANSFER,
+                                MediaFormat.COLOR_TRANSFER_SDR_VIDEO);
                         //videoFormat.setInteger(MediaFormat.KEY_LATENCY, 1);
 
                         
@@ -779,35 +791,7 @@ public class FlutterQuickVideoEncoderPlugin implements
     }
 
     private byte[] rgbaToYuv420Planar(byte[] rgba, int width, int height) {
-        final int frameSize = width * height;
-
-        int yIndex = 0;
-        int uIndex = frameSize;
-        int vIndex = frameSize + (frameSize / 4);
-
-        byte[] yuv420 = new byte[width * height * 3 / 2];
-
-        int r, g, b, y, u, v;
-        for (int j = 0; j < height; j++) {
-            for (int i = 0; i < width; i++) {
-                r = rgba[j * width * 4 + i * 4] & 0xFF;
-                g = rgba[j * width * 4 + i * 4 + 1] & 0xFF;
-                b = rgba[j * width * 4 + i * 4 + 2] & 0xFF;
-
-                // RGB to YUV formula
-                y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-
-                yuv420[yIndex++] = (byte) Math.max(0, Math.min(255, y));
-                if (j % 2 == 0 && i % 2 == 0) {
-                    yuv420[uIndex++] = (byte) Math.max(0, Math.min(255, u));
-                    yuv420[vIndex++] = (byte) Math.max(0, Math.min(255, v));
-                }
-            }
-        }
-
-        return yuv420;
+        return FrameYuv.toYuv420Planar(rgba, width, height);
     }
 
     private void fillImage(Image image, byte[] yuv420, int width, int height) {
