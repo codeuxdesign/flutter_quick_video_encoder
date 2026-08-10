@@ -35,7 +35,8 @@ public class ClipBlendTest {
         Arrays.fill(u, (byte) 128);
         Arrays.fill(v, (byte) 128);
         return new ClipFrame(y, u, v, width, height,
-                new ClipColor(ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, true), 0L);
+                new ClipColor(ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, true), 0L,
+                false);
     }
 
     private static byte[] filled(int width, int height, int r, int g, int b, int a) {
@@ -190,7 +191,8 @@ public class ClipBlendTest {
         final byte[] cb = {(byte) 128, (byte) 200, (byte) 128, (byte) 200};
         final byte[] cr = {(byte) 200, (byte) 128, (byte) 200, (byte) 128};
         final ClipFrame clip = new ClipFrame(luma, cb, cr, 4, 4,
-                new ClipColor(ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, true), 0L);
+                new ClipColor(ClipColor.STANDARD_BT709, ClipColor.TRANSFER_SDR, true), 0L,
+                false);
 
         final byte[] dst = filled(4, 4, 0, 0, 0, 0);
         ClipBlend.blend(dst, 4, 4, clip, 0, 0, 4, 4, 0);

@@ -383,7 +383,7 @@ final class ClipReader {
                 slot[2], left / 2, top / 2, chromaWidth, chromaHeight, tenBit);
 
         return new ClipFrame(slot[0], slot[1], slot[2], width, height, color,
-                presentationTimeUs);
+                presentationTimeUs, tenBit);
     }
 
     /**

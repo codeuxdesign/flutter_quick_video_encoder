@@ -36,8 +36,23 @@ final class ClipFrame {
     final ClipColor color;
     final long presentationTimeUs;
 
+    /**
+     * Whether the decoder handed this frame back as `YCBCR_P010` rather than
+     * `YUV_420_888`.
+     *
+     * <p><b>Carried so a test can assert which branch ran, not just that the
+     * pixels look plausible.</b> A 10-bit source does not guarantee a 10-bit
+     * image: ask for `COLOR_FormatYUV420Flexible` and a decoder is free to hand
+     * back 8-bit, having tone-mapped or truncated on the way. The frame then
+     * decodes, converts and composites perfectly well, and the P010 path this
+     * flag names never executes — so a test checking only the colors passes
+     * while covering nothing. Bit depth is not observable from the output; it
+     * has to be reported by the thing that saw it.
+     */
+    final boolean tenBit;
+
     ClipFrame(byte[] luma, byte[] cb, byte[] cr, int width, int height,
-              ClipColor color, long presentationTimeUs) {
+              ClipColor color, long presentationTimeUs, boolean tenBit) {
         this.luma = luma;
         this.cb = cb;
         this.cr = cr;
@@ -47,6 +62,7 @@ final class ClipFrame {
         this.chromaHeight = (height + 1) / 2;
         this.color = color;
         this.presentationTimeUs = presentationTimeUs;
+        this.tenBit = tenBit;
     }
 
     /**
