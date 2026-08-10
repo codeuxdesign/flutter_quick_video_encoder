@@ -39,12 +39,29 @@ enum ProfileLevel {
 /// caller that assumed `maxEdge` square, or assumed the track's natural size,
 /// would lay the bytes out sheared.
 ///
-/// **The pixels are in the file's stored orientation.** Rotation is metadata
-/// the container carries beside the samples, and the export applies it in
-/// `appendVideoFrame`'s `quarterTurns` rather than in the reader — so a preview
-/// that turned the frame here would be showing something the export does not
-/// draw. Turn it in the widget with the same `quarterTurns` the hole will
-/// carry.
+/// **They also describe the frame as *stored*, so a caller laying out a rotated
+/// clip has to swap them.** Portrait footage from a camera that recorded
+/// landscape and tagged a quarter turn arrives here 1920x1080, and the picture
+/// the rider is going to see is 1080x1920. The axis swap is the part that gets
+/// missed — "rotation is not applied" reads as a statement about the pixels,
+/// and it is equally a statement about these two integers.
+///
+/// **The pixels are in the file's stored orientation, and the angle is not
+/// reported here on purpose.** Rotation is metadata the container carries
+/// beside the samples; the export reads it and applies it as a hole's
+/// `quarterTurns`, and this deliberately does not surface a second copy. The
+/// caller supplies the turn from wherever it already got the one it will pass
+/// to [FlutterQuickVideoEncoder.appendVideoFrame] — which means there is
+/// exactly one rotation decision in the system and the preview sits downstream
+/// of it rather than beside it. Two places that decide which way up a clip is
+/// would agree until one of them changed, and then a rider would be trimming
+/// against a picture the film does not draw, with nothing failing.
+///
+/// The cost lands on every caller — a `RotatedBox` and an aspect ratio built
+/// from the swapped edges — and it is worth paying because *this* mistake is
+/// loud. A preview turned the wrong way is a sideways picture on screen; a
+/// preview that quietly disagreed with the export about rotation is a wrong cut
+/// in a published film.
 class ClipPreviewFrame {
   const ClipPreviewFrame({
     required this.rgba,
@@ -248,12 +265,31 @@ class FlutterQuickVideoEncoder {
   /// ships, this has to follow the chosen output space or it stops being a
   /// promise about the film.
   ///
+  /// **The frame comes back unrotated, and [ClipPreviewFrame.width] and
+  /// [ClipPreviewFrame.height] are the stored edges — swap them to lay out a
+  /// clip the container tagged with a quarter or three-quarter turn.** The
+  /// angle is not returned; take it from wherever the `quarterTurns` you will
+  /// pass to [appendVideoFrame] comes from, so that one rotation decision
+  /// serves both the preview and the film. [ClipPreviewFrame] has the argument
+  /// for why that asymmetry is deliberate.
+  ///
   /// [maxEdge] caps the longer side, and the frame is downsampled
   /// nearest-neighbor to fit — the same sampling the composite uses. It is not
   /// a formality: a 4K frame is 33 MB of RGBA, which is a jetsam risk to hand
   /// across the method channel per scrub position and pointless for a preview a
   /// few hundred pixels wide. A frame already smaller than [maxEdge] is passed
   /// through at its own size rather than scaled up.
+  ///
+  /// **Calls queue; none of them is dropped or superseded.** Decoding happens
+  /// off the platform thread, one request at a time, in the order they arrive —
+  /// so a handle that emits ten positions decodes ten frames and the tenth
+  /// arrives after the other nine, rather than the first nine being discarded
+  /// in its favor. A caller that scrubs therefore has to coalesce: hold at most
+  /// one pending position and replace it, rather than issuing one call per
+  /// pointer event. Coalescing here instead would mean completing a superseded
+  /// call with *something*, and the only spare value is null — which already
+  /// means "this clip has no picture" and must not come to mean "a newer
+  /// request overtook you" as well.
   ///
   /// **Readers are cached by path and have to be let go explicitly**, see
   /// [releaseClipPreviews]. Measured on macOS against a 4K HEVC Main10 clip,
