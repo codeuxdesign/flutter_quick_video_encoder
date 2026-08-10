@@ -93,6 +93,19 @@ final class SyntheticClip {
         format.setInteger(MediaFormat.KEY_COLOR_STANDARD, standard);
         format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, transfer);
         format.setInteger(MediaFormat.KEY_COLOR_RANGE, range);
+        writeWithFormat(target, mime, width, height, frames, format);
+    }
+
+    /**
+     * As above, but encoded with a caller's format.
+     *
+     * <p>So a test can encode with **the plugin's own** `EncoderFormat` rather
+     * than with values it typed itself. Passing the color tags in by hand
+     * proves the platform round-trips them and proves nothing about whether this
+     * encoder sets them — which is the half that actually regressed.
+     */
+    static void writeWithFormat(File target, String mime, int width, int height,
+                                int frames, MediaFormat format) throws Exception {
 
         final MediaCodec encoder = MediaCodec.createEncoderByType(mime);
         MediaMuxer muxer = null;

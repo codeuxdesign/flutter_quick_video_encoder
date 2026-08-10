@@ -216,35 +216,23 @@ public class FlutterQuickVideoEncoderPlugin implements
 
                         // color format
                         int colorFormat = getColorFormat();
-                        if (isColorFormatSupported("video/avc", colorFormat) == false) {
+                        if (isColorFormatSupported(EncoderFormat.MIME, colorFormat) == false) {
                             result.error("UnsupportedColorFormat", "COLOR_FormatYUV420Flexible is not supported", null);
                             return;
                         }
                             
-                        // Video format
+                        // Video format. Built in `EncoderFormat` rather than
+                        // here so a test can assert the color tags are on it —
+                        // they are the part a later change drops silently while
+                        // the pixels still look approximately right.
                         Log.i(TAG, "calling MediaFormat.createVideoFormat()");
-                        MediaFormat videoFormat = MediaFormat.createVideoFormat("video/avc", width, height);
-                        videoFormat.setInteger(MediaFormat.KEY_BIT_RATE, videoBitrate);
-                        videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
-                        videoFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat);
-                        videoFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
-                        // Say which matrix the samples were written with, rather
-                        // than letting the player infer one from the frame size.
-                        // `FrameYuv` uses Rec.709 limited range; the draft target
-                        // is 540x960, which is under the 720-line boundary where
-                        // some players switch their default to Rec.601, so the
-                        // inference and the truth would disagree.
-                        videoFormat.setInteger(MediaFormat.KEY_COLOR_STANDARD,
-                                MediaFormat.COLOR_STANDARD_BT709);
-                        videoFormat.setInteger(MediaFormat.KEY_COLOR_RANGE,
-                                MediaFormat.COLOR_RANGE_LIMITED);
-                        videoFormat.setInteger(MediaFormat.KEY_COLOR_TRANSFER,
-                                MediaFormat.COLOR_TRANSFER_SDR_VIDEO);
+                        MediaFormat videoFormat =
+                                EncoderFormat.video(width, height, videoBitrate, fps, colorFormat);
                         //videoFormat.setInteger(MediaFormat.KEY_LATENCY, 1);
 
                         
                         // Video encoder
-                        mVideoEncoder = MediaCodec.createEncoderByType("video/avc");
+                        mVideoEncoder = MediaCodec.createEncoderByType(EncoderFormat.MIME);
                         Log.i(TAG, "calling mVideoEncoder.configure()");
                         mVideoEncoder.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
 
