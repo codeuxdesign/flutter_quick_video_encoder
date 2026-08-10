@@ -19,6 +19,8 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
@@ -71,6 +73,15 @@ public class FlutterQuickVideoEncoderPlugin implements
     private Queue<EncodedData> videoQueue = new LinkedList<>();
     private Queue<EncodedData> audioQueue = new LinkedList<>();
 
+    /**
+     * Fills the rectangles the painter cleared, or null until a frame asks for
+     * one. Held across frames because every clip is one decode session, and
+     * released with the film it was opened for — keeping it would leak a
+     * decoder per source per export, and a second export of the same file would
+     * resume the first one's reader partway through rather than starting again.
+     */
+    private ClipCompositor mClipCompositor;
+
     // input queue for video, audio, and stop signals
     private BlockingQueue<InputData> inputQueue = new LinkedBlockingQueue<>(5);
 
@@ -89,6 +100,14 @@ public class FlutterQuickVideoEncoderPlugin implements
     @Override
     public void onDetachedFromEngine(FlutterPluginBinding binding) {
         mMethodChannel.setMethodCallHandler(null);
+        releaseClipCompositor();
+    }
+
+    private void releaseClipCompositor() {
+        if (mClipCompositor != null) {
+            mClipCompositor.release();
+            mClipCompositor = null;
+        }
     }
 
     @Override
@@ -109,6 +128,7 @@ public class FlutterQuickVideoEncoderPlugin implements
 
                     // reset
                     stopProcessingThread();
+                    releaseClipCompositor();
 
                     // Extract parameters
                     int width =         call.argument("width");
@@ -219,6 +239,38 @@ public class FlutterQuickVideoEncoderPlugin implements
 
                     byte[] rawRgba = call.argument("rawRgba");
 
+                    // Fill the caller's holes with video before anything is
+                    // encoded.
+                    //
+                    // In place, and that is safe here in a way it is not on
+                    // Apple: `rawRgba` is decoded out of the method channel
+                    // into a byte[] of its own, so there is no caller's buffer
+                    // to protect. The Apple side takes a mutable copy for
+                    // exactly that reason.
+                    //
+                    // Before the YUV conversion, necessarily — the compositor
+                    // reads the straight alpha the painter wrote, and the
+                    // conversion below throws alpha away.
+                    List<?> holes = call.argument("holes");
+                    if (holes != null && !holes.isEmpty()) {
+                        if (mClipCompositor == null) {
+                            mClipCompositor = new ClipCompositor();
+                        }
+                        try {
+                            mClipCompositor.fill(rawRgba, mWidth, mHeight, holes);
+                        } catch (Exception e) {
+                            // Loud, and it ends the export. A hole that is not
+                            // filled encodes as a black window in a file that
+                            // is otherwise valid and the right length, which
+                            // nothing downstream can tell from a film that came
+                            // out right.
+                            Log.e(TAG, "clip composite failed", e);
+                            result.error("ClipCompositeFailed", e.getMessage(),
+                                    stackTraceOf(e));
+                            return;
+                        }
+                    }
+
                     // Convert RGBA to YUV420
                     // Perf: we get better results doing this here on the Platform thread,
                     // as opposed to doing it in the processing thread.
@@ -253,8 +305,30 @@ public class FlutterQuickVideoEncoderPlugin implements
                     result.success(null);
                     break;
                 }
+                case "checkClipsDecodable":
+                {
+                    // Asked *before* a render rather than discovered inside one.
+                    // A refusal that arrives four thousand frames in is a
+                    // refusal that arrives after the waiting.
+                    //
+                    // The answer is a map of path to reason, empty when every
+                    // clip opened and produced a frame. Named paths rather than
+                    // a count, because the message a rider needs is which of
+                    // *their* files this device cannot read.
+                    List<?> paths = call.argument("paths");
+                    Map<String, String> failures = paths == null
+                            ? new java.util.LinkedHashMap<String, String>()
+                            : ClipCompositor.undecodable(paths);
+                    result.success(failures);
+                    break;
+                }
                 case "finish":
                 {
+                    // Let the clip readers go with the film they were opened
+                    // for. Each holds a decode session and a frame's worth of
+                    // planes, and a 4K source is tens of megabytes of them.
+                    releaseClipCompositor();
+
                     // if processing error, throw exception
                     if (processingResult.isDone()) {
                         processingResult.get();
@@ -285,13 +359,16 @@ public class FlutterQuickVideoEncoderPlugin implements
                     break;
             }
         } catch (Exception e) {
-            StringWriter sw = new StringWriter();
-            PrintWriter pw = new PrintWriter(sw);
-            e.printStackTrace(pw);
-            String stackTrace = sw.toString();
-            result.error("androidException", e.toString(), stackTrace);
+            result.error("androidException", e.toString(), stackTraceOf(e));
             return;
         }
+    }
+
+    private static String stackTraceOf(Exception e) {
+        StringWriter sw = new StringWriter();
+        PrintWriter pw = new PrintWriter(sw);
+        e.printStackTrace(pw);
+        return sw.toString();
     }
 
     /**

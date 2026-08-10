@@ -1,0 +1,608 @@
+package com.lib.flutter_quick_video_encoder;
+
+import android.graphics.ImageFormat;
+import android.graphics.Rect;
+import android.media.Image;
+import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
+import android.util.Log;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+
+/**
+ * One clip source file, decoded forward, holding the frame that is on screen.
+ *
+ * <p>The Apple counterpart is {@code FQVEClipReader}: one {@code AVAssetReader}
+ * per path, cached across frames, never seeking, holding the last sample because
+ * several output frames land inside one source frame whenever the film runs
+ * slower than the clip. The shape here is the same. Two things differ, and both
+ * are facts about Android rather than choices.
+ *
+ * <p><b>It seeks on a large jump.</b> The Apple reader walks the file from the
+ * beginning and pays for it once: the corpus film wants four seconds starting at
+ * 0:12 and five starting at 1:36, so a reader that never seeks decodes eighty
+ * seconds of 4K HEVC inside one output frame's turn. On a Mac that is a pause.
+ * On a phone it is a pause long enough to look like a hang, in a run nobody can
+ * attach a debugger to. A seek to the sync sample at or before the wanted
+ * instant costs one decoder rebuild and lands in the same place. Seeks are
+ * counted and logged, because the failure mode of this optimization is seeking
+ * every frame, and that has to be visible rather than inferred from how long the
+ * export took.
+ *
+ * <p><b>It rebuilds the decoder to seek rather than flushing it.</b>
+ * {@code MediaCodec.flush()} in synchronous mode leaves the codec in a state
+ * whose documented recovery — whether {@code start()} must follow — is read
+ * differently by different codebases, and this code cannot be run on a device
+ * before it ships. A seek happens about twice per film, a rebuild costs tens of
+ * milliseconds, and the ambiguity disappears.
+ */
+final class ClipReader {
+
+    private static final String TAG = "[FQVE-Android]";
+
+    /**
+     * How far ahead the film may ask before it is cheaper to seek than to
+     * decode. Two seconds is well past any within-clip jitter, so ordinary
+     * playback never trips it, while the eighty-second jump between the corpus
+     * clip's two ranges does.
+     */
+    private static final long SEEK_AHEAD_US = 2_000_000L;
+
+    private static final long DEQUEUE_TIMEOUT_US = 10_000L;
+
+    /**
+     * How long one {@code frameAtTime} may spend before it is called wedged.
+     * Generous, because a seek that lands at the start of a long GOP legitimately
+     * decodes a second of video — but bounded, so a decoder that has stopped
+     * producing fails the export loudly instead of hanging the platform thread
+     * with nothing on screen to say why.
+     */
+    private static final long FRAME_DEADLINE_NANOS = 20_000_000_000L;
+
+    final String path;
+
+    private final MediaExtractor extractor = new MediaExtractor();
+    private final MediaFormat trackFormat;
+    private final String decoderName;
+    private final String mime;
+    private final int trackIndex;
+
+    private MediaCodec codec;
+    private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+
+    private ClipColor color;
+    private boolean colorFromOutputFormat;
+
+    /** The frame covering the last requested instant. */
+    private ClipFrame current;
+    /** The first decoded frame past that instant, kept so it is not decoded twice. */
+    private ClipFrame ahead;
+
+    private byte[][] slotA;
+    private byte[][] slotB;
+    private int slotWidth;
+    private int slotHeight;
+
+    private boolean inputDone;
+    private boolean outputDone;
+    private int seekCount;
+    private int decodedFrames;
+
+    ClipReader(String path) throws IOException {
+        this.path = path;
+        extractor.setDataSource(path);
+
+        int track = -1;
+        MediaFormat format = null;
+        for (int i = 0; i < extractor.getTrackCount(); i++) {
+            final MediaFormat candidate = extractor.getTrackFormat(i);
+            final String type = candidate.getString(MediaFormat.KEY_MIME);
+            if (type != null && type.startsWith("video/")) {
+                track = i;
+                format = candidate;
+                break;
+            }
+        }
+        if (track < 0) {
+            extractor.release();
+            throw new IOException("no video track in " + path);
+        }
+        trackIndex = track;
+        trackFormat = format;
+        mime = format.getString(MediaFormat.KEY_MIME);
+        extractor.selectTrack(trackIndex);
+
+        decoderName = chooseDecoder(format, mime);
+        if (decoderName == null) {
+            extractor.release();
+            throw new IOException(noDecoderReason(format, mime));
+        }
+
+        color = colorFrom(format, defaultColor(format));
+        // Started here rather than lazily, so that a file this device cannot
+        // configure a decoder for fails while it is still being opened. The
+        // first `frameAtTime` seeks and rebuilds it; that is one wasted decoder
+        // per clip and it buys the preflight in `ClipCompositor.undecodable`.
+        startDecoder();
+
+        Log.i(TAG, "CLIP open " + path
+                + " " + format.getInteger(MediaFormat.KEY_WIDTH)
+                + "x" + format.getInteger(MediaFormat.KEY_HEIGHT)
+                + " " + mime
+                + " color=" + color.describe()
+                + " decoder=" + decoderName);
+    }
+
+    /**
+     * The frame covering [timeUs], decoded forward from wherever the reader is.
+     *
+     * <p>Holds the last frame rather than decoding one per call, because several
+     * output frames land inside one source frame whenever the film runs slower
+     * than the clip — and because a source that has run out should keep showing
+     * its final frame rather than vanish.
+     */
+    ClipFrame frameAtTime(long timeUs) throws IOException {
+        final long from = current == null ? Long.MIN_VALUE : current.presentationTimeUs;
+        // The forward test is skipped once the file has run out: a film that
+        // keeps asking past the end would otherwise seek on every frame, each
+        // one landing on the same last sync sample.
+        final boolean farAhead = !outputDone && timeUs > from + SEEK_AHEAD_US;
+        if (from == Long.MIN_VALUE || timeUs < from || farAhead) {
+            seekTo(timeUs);
+        }
+
+        final long deadline = System.nanoTime() + FRAME_DEADLINE_NANOS;
+        while (true) {
+            if (ahead != null) {
+                if (ahead.presentationTimeUs <= timeUs) {
+                    current = ahead;
+                    ahead = null;
+                    continue;
+                }
+                break;
+            }
+            if (outputDone) {
+                break;
+            }
+            final ClipFrame decoded = decodeOne(deadline);
+            if (decoded == null) {
+                break;
+            }
+            if (decoded.presentationTimeUs <= timeUs || current == null) {
+                current = decoded;
+            } else {
+                ahead = decoded;
+                break;
+            }
+        }
+
+        if (current == null) {
+            throw new IOException("decoded no frames at " + timeUs + "us from " + path);
+        }
+        return current;
+    }
+
+    void close() {
+        Log.i(TAG, "CLIP close " + path
+                + " decoded=" + decodedFrames + " seeks=" + seekCount);
+        releaseDecoder();
+        try {
+            extractor.release();
+        } catch (Exception ignored) {
+            // Releasing twice, or releasing one that never opened, is not worth
+            // failing an export that has otherwise finished.
+        }
+        current = null;
+        ahead = null;
+        slotA = null;
+        slotB = null;
+    }
+
+    // ---- decoding ----------------------------------------------------------
+
+    private void seekTo(long timeUs) throws IOException {
+        extractor.seekTo(Math.max(0L, timeUs), MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+        releaseDecoder();
+        current = null;
+        ahead = null;
+        inputDone = false;
+        outputDone = false;
+        seekCount++;
+        startDecoder();
+        Log.i(TAG, "CLIP seek " + path + " to " + timeUs + "us"
+                + " landed=" + extractor.getSampleTime() + "us"
+                + " total=" + seekCount);
+    }
+
+    private void startDecoder() throws IOException {
+        // Asked for again rather than reused. `getTrackFormat` builds a fresh
+        // MediaFormat every call, and with it fresh `csd-N` buffers — and
+        // `configure` consumes those buffers from their current position, so a
+        // second decoder built from the same format object after a seek would
+        // be handed empty parameter sets and refuse to start on the devices
+        // that need them.
+        final MediaFormat configure = extractor.getTrackFormat(trackIndex);
+        // **Flexible, and read through getOutputImage.** Asking for a concrete
+        // layout is how the classic Android video bug is written: one device
+        // hands back planar, the next semiplanar, and the code that assumed one
+        // of them is wrong on half the phones in the world with no error
+        // anywhere. Flexible plus the Image's own row and pixel strides is the
+        // only portable read.
+        configure.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
+
+        codec = MediaCodec.createByCodecName(decoderName);
+        codec.configure(configure, null, null, 0);
+        codec.start();
+    }
+
+    private void releaseDecoder() {
+        if (codec == null) {
+            return;
+        }
+        try {
+            codec.stop();
+        } catch (Exception ignored) {
+            // A codec that never produced anything can refuse to stop. It is
+            // still going to be released on the next line.
+        }
+        try {
+            codec.release();
+        } catch (Exception ignored) {
+            // Same.
+        }
+        codec = null;
+    }
+
+    private ClipFrame decodeOne(long deadlineNanos) throws IOException {
+        while (true) {
+            feedInput();
+            final int index = codec.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US);
+            if (index >= 0) {
+                final boolean eos =
+                        (bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+                final boolean config =
+                        (bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+                if (config || bufferInfo.size == 0) {
+                    codec.releaseOutputBuffer(index, false);
+                    if (eos) {
+                        outputDone = true;
+                        return null;
+                    }
+                    continue;
+                }
+                final ClipFrame frame = takeFrame(index, bufferInfo.presentationTimeUs);
+                if (eos) {
+                    outputDone = true;
+                }
+                if (frame != null) {
+                    decodedFrames++;
+                    return frame;
+                }
+                if (outputDone) {
+                    return null;
+                }
+                continue;
+            }
+            if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                adoptOutputFormat(codec.getOutputFormat());
+                continue;
+            }
+            if (index == MediaCodec.INFO_TRY_AGAIN_LATER && System.nanoTime() > deadlineNanos) {
+                throw new IOException("decoder produced nothing for "
+                        + (FRAME_DEADLINE_NANOS / 1_000_000_000L) + "s on " + path
+                        + " (decoder=" + decoderName + ")");
+            }
+        }
+    }
+
+    private void feedInput() {
+        while (!inputDone) {
+            final int index = codec.dequeueInputBuffer(0);
+            if (index < 0) {
+                return;
+            }
+            final ByteBuffer buffer = codec.getInputBuffer(index);
+            if (buffer == null) {
+                return;
+            }
+            buffer.clear();
+            final int size = extractor.readSampleData(buffer, 0);
+            if (size < 0) {
+                codec.queueInputBuffer(index, 0, 0, 0L,
+                        MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                inputDone = true;
+                return;
+            }
+            codec.queueInputBuffer(index, 0, size, extractor.getSampleTime(), 0);
+            extractor.advance();
+        }
+    }
+
+    /** Copies one decoded frame out of the codec and gives the buffer back. */
+    private ClipFrame takeFrame(int index, long presentationTimeUs) throws IOException {
+        Image image = null;
+        try {
+            image = codec.getOutputImage(index);
+            if (image == null) {
+                return null;
+            }
+            return copyImage(image, presentationTimeUs);
+        } finally {
+            if (image != null) {
+                image.close();
+            }
+            codec.releaseOutputBuffer(index, false);
+        }
+    }
+
+    private ClipFrame copyImage(Image image, long presentationTimeUs) throws IOException {
+        final int format = image.getFormat();
+        final boolean tenBit = format == ImageFormat.YCBCR_P010;
+        if (!tenBit && format != ImageFormat.YUV_420_888) {
+            throw new IOException("decoder handed back image format " + format
+                    + ", which is neither YUV_420_888 nor YCBCR_P010, for " + path);
+        }
+
+        Rect crop = image.getCropRect();
+        int left = 0;
+        int top = 0;
+        int width = image.getWidth();
+        int height = image.getHeight();
+        if (crop != null && crop.width() > 0 && crop.height() > 0) {
+            left = crop.left;
+            top = crop.top;
+            width = crop.width();
+            height = crop.height();
+        }
+        // Odd sizes would put the last chroma column outside the plane. No
+        // encoder in this pipeline accepts an odd dimension either, so rounding
+        // the sampled area down by a pixel is invisible and safe.
+        width &= ~1;
+        height &= ~1;
+        if (width <= 0 || height <= 0) {
+            throw new IOException("decoded frame has no usable area for " + path);
+        }
+
+        final int chromaWidth = width / 2;
+        final int chromaHeight = height / 2;
+        final byte[][] slot = slotFor(width, height, chromaWidth, chromaHeight);
+
+        final Image.Plane[] planes = image.getPlanes();
+        copyPlane(planes[0], slot[0], left, top, width, height, tenBit);
+        copyPlane(planes[1], slot[1], left / 2, top / 2, chromaWidth, chromaHeight, tenBit);
+        copyPlane(planes[2], slot[2], left / 2, top / 2, chromaWidth, chromaHeight, tenBit);
+
+        return new ClipFrame(slot[0], slot[1], slot[2], width, height, color,
+                presentationTimeUs);
+    }
+
+    /**
+     * Reads one plane into a tightly packed array, whatever the device's layout.
+     *
+     * <p>Row stride is almost never the width and chroma pixel stride is 1 on a
+     * planar device and 2 on a semiplanar one. For 10-bit output each sample is
+     * two little-endian bytes with the data in the top bits, so the high byte
+     * alone is the 8-bit value — which is all an 8-bit sRGB frame can carry.
+     */
+    private static void copyPlane(Image.Plane plane, byte[] out,
+                                  int left, int top, int width, int height,
+                                  boolean tenBit) {
+        final ByteBuffer buffer = plane.getBuffer();
+        final int rowStride = plane.getRowStride();
+        final int pixelStride = plane.getPixelStride();
+        final int sampleOffset = tenBit ? 1 : 0;
+
+        if (!tenBit && pixelStride == 1) {
+            // The common planar case: one bulk copy per row, straight into the
+            // packed array. A direct ByteBuffer's bulk get is a native memcpy;
+            // the per-sample loop below is not, which is why it is worth
+            // separating the two.
+            for (int y = 0; y < height; y++) {
+                buffer.position((top + y) * rowStride + left);
+                buffer.get(out, y * width, width);
+            }
+            return;
+        }
+
+        for (int y = 0; y < height; y++) {
+            final int base = (top + y) * rowStride + left * pixelStride + sampleOffset;
+            final int dst = y * width;
+            for (int x = 0; x < width; x++) {
+                out[dst + x] = buffer.get(base + x * pixelStride);
+            }
+        }
+    }
+
+    private byte[][] slotFor(int width, int height, int chromaWidth, int chromaHeight) {
+        if (slotA == null || slotWidth != width || slotHeight != height) {
+            slotWidth = width;
+            slotHeight = height;
+            slotA = newSlot(width, height, chromaWidth, chromaHeight);
+            slotB = newSlot(width, height, chromaWidth, chromaHeight);
+            current = null;
+            ahead = null;
+        }
+        // Two plane sets are enough: a frame is only ever decoded while `ahead`
+        // is empty, so at most one of them is live when a new one is written.
+        if (current != null && current.luma == slotA[0]) {
+            return slotB;
+        }
+        return slotA;
+    }
+
+    private static byte[][] newSlot(int width, int height, int chromaWidth, int chromaHeight) {
+        return new byte[][]{
+                new byte[width * height],
+                new byte[chromaWidth * chromaHeight],
+                new byte[chromaWidth * chromaHeight],
+        };
+    }
+
+    // ---- color -------------------------------------------------------------
+
+    private void adoptOutputFormat(MediaFormat format) {
+        final ClipColor refined = colorFrom(format, null);
+        if (refined == null || colorFromOutputFormat) {
+            return;
+        }
+        colorFromOutputFormat = true;
+        color = refined;
+        Log.i(TAG, "CLIP color " + path + " " + color.describe()
+                + " (from the decoder's output format)");
+    }
+
+    /**
+     * What the file says its color is, or [fallback] when it does not say.
+     *
+     * <p>Returns null rather than guessing when [fallback] is null, so the
+     * decoder's output format can be used to refine the track format's answer
+     * without overwriting it with silence.
+     */
+    private static ClipColor colorFrom(MediaFormat format, ClipColor fallback) {
+        final boolean hasStandard = format.containsKey(MediaFormat.KEY_COLOR_STANDARD);
+        final boolean hasTransfer = format.containsKey(MediaFormat.KEY_COLOR_TRANSFER);
+        final boolean hasRange = format.containsKey(MediaFormat.KEY_COLOR_RANGE);
+        if (!hasStandard && !hasTransfer && !hasRange) {
+            return fallback;
+        }
+
+        int standard = fallback != null ? fallback.standard : ClipColor.STANDARD_BT709;
+        if (hasStandard) {
+            switch (format.getInteger(MediaFormat.KEY_COLOR_STANDARD)) {
+                case MediaFormat.COLOR_STANDARD_BT601_PAL:
+                case MediaFormat.COLOR_STANDARD_BT601_NTSC:
+                    standard = ClipColor.STANDARD_BT601;
+                    break;
+                case MediaFormat.COLOR_STANDARD_BT2020:
+                    standard = ClipColor.STANDARD_BT2020;
+                    break;
+                default:
+                    standard = ClipColor.STANDARD_BT709;
+                    break;
+            }
+        }
+
+        int transfer = fallback != null ? fallback.transfer : ClipColor.TRANSFER_SDR;
+        if (hasTransfer) {
+            switch (format.getInteger(MediaFormat.KEY_COLOR_TRANSFER)) {
+                case MediaFormat.COLOR_TRANSFER_HLG:
+                    transfer = ClipColor.TRANSFER_HLG;
+                    break;
+                case MediaFormat.COLOR_TRANSFER_ST2084:
+                    transfer = ClipColor.TRANSFER_PQ;
+                    break;
+                default:
+                    transfer = ClipColor.TRANSFER_SDR;
+                    break;
+            }
+        }
+
+        boolean fullRange = fallback != null && fallback.fullRange;
+        if (hasRange) {
+            fullRange = format.getInteger(MediaFormat.KEY_COLOR_RANGE)
+                    == MediaFormat.COLOR_RANGE_FULL;
+        }
+
+        return new ClipColor(standard, transfer, fullRange);
+    }
+
+    /**
+     * What to assume about a file that carries no color keys at all.
+     *
+     * <p>Rec.709 limited above standard definition and Rec.601 limited below it,
+     * which is what every player assumes and what the file was almost certainly
+     * authored against. Guessing is unavoidable here; what is avoidable is
+     * guessing quietly, so the assumption is printed with the clip.
+     */
+    private static ClipColor defaultColor(MediaFormat format) {
+        final int height = format.containsKey(MediaFormat.KEY_HEIGHT)
+                ? format.getInteger(MediaFormat.KEY_HEIGHT) : 1080;
+        return new ClipColor(
+                height >= 720 ? ClipColor.STANDARD_BT709 : ClipColor.STANDARD_BT601,
+                ClipColor.TRANSFER_SDR,
+                false);
+    }
+
+    // ---- decoder selection -------------------------------------------------
+
+    /**
+     * A decoder that supports this file's profile and level, or null.
+     *
+     * <p><b>4K HEVC decode is not universal</b>, and
+     * {@code createDecoderByType("video/hevc")} answers a question nobody asked:
+     * it returns a decoder for the *mime type*, which then fails at configure
+     * time or, worse, produces garbage. Matching on a format that carries the
+     * profile and level is what makes "this phone cannot play this clip" a fact
+     * discovered before the export starts rather than a black rectangle
+     * discovered by the audience.
+     */
+    static String chooseDecoder(MediaFormat trackFormat, String mime) {
+        final MediaCodecList list = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
+        final String strict = findDecoder(list, probeFormat(trackFormat, mime, true));
+        if (strict != null) {
+            return strict;
+        }
+
+        // A file whose declared profile and level nothing claims is not
+        // necessarily unplayable — some decoders under-declare. Fall back to
+        // matching on size alone, and say so, because a clip that plays only
+        // because a check was relaxed is worth seeing in the log if it later
+        // comes out wrong.
+        final String loose = findDecoder(list, probeFormat(trackFormat, mime, false));
+        if (loose != null) {
+            Log.w(TAG, "CLIP no decoder declares " + mime
+                    + " profile=" + intOrMinusOne(trackFormat, MediaFormat.KEY_PROFILE)
+                    + " level=" + intOrMinusOne(trackFormat, MediaFormat.KEY_LEVEL)
+                    + "; falling back to " + loose + " on size alone");
+        }
+        return loose;
+    }
+
+    private static String findDecoder(MediaCodecList list, MediaFormat probe) {
+        try {
+            return list.findDecoderForFormat(probe);
+        } catch (IllegalArgumentException e) {
+            // Thrown for a format the framework will not even consider. That is
+            // an answer — nothing here can play it — not a reason to stop.
+            Log.w(TAG, "CLIP findDecoderForFormat rejected " + probe, e);
+            return null;
+        }
+    }
+
+    private static MediaFormat probeFormat(MediaFormat trackFormat, String mime,
+                                           boolean withProfileLevel) {
+        final MediaFormat probe = MediaFormat.createVideoFormat(
+                mime,
+                trackFormat.getInteger(MediaFormat.KEY_WIDTH),
+                trackFormat.getInteger(MediaFormat.KEY_HEIGHT));
+        if (withProfileLevel) {
+            copyIntIfPresent(trackFormat, probe, MediaFormat.KEY_PROFILE);
+            copyIntIfPresent(trackFormat, probe, MediaFormat.KEY_LEVEL);
+        }
+        return probe;
+    }
+
+    /** Why nothing on this device can decode the file, in words a rider can act on. */
+    private static String noDecoderReason(MediaFormat format, String mime) {
+        return "no decoder on this device supports " + mime + " "
+                + format.getInteger(MediaFormat.KEY_WIDTH) + "x"
+                + format.getInteger(MediaFormat.KEY_HEIGHT)
+                + " profile=" + intOrMinusOne(format, MediaFormat.KEY_PROFILE)
+                + " level=" + intOrMinusOne(format, MediaFormat.KEY_LEVEL);
+    }
+
+    private static void copyIntIfPresent(MediaFormat from, MediaFormat to, String key) {
+        if (from.containsKey(key)) {
+            to.setInteger(key, from.getInteger(key));
+        }
+    }
+
+    private static int intOrMinusOne(MediaFormat format, String key) {
+        return format.containsKey(key) ? format.getInteger(key) : -1;
+    }
+}

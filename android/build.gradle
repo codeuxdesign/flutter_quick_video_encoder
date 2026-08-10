@@ -32,3 +32,15 @@ android {
 
     namespace 'com.lib.flutter_quick_video_encoder'
 }
+
+// The clip compositor's color conversion and its blend are deliberately free of
+// android imports, so they run here on the host rather than only on a phone.
+// That is the only part of the Android clip path a laptop can test at all, and
+// it is the part that has historically been wrong — the source-over arithmetic
+// was wrong for a day on Apple, and the HLG conversion has no Apple counterpart
+// to compare against.
+//
+//   (cd app/android && ./gradlew :flutter_quick_video_encoder:testDebugUnitTest)
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}
