@@ -113,17 +113,23 @@ public class ClipColorTest {
     /**
      * The one the whole HDR path exists for.
      *
-     * <p>BT.2408 puts HLG diffuse white at 75% of the signal range. Converted, it
-     * has to land on sRGB white — that is what stops a drone clip reading a stop
-     * darker and greyer than the map it is composited into, which is precisely
-     * how this failed on Apple before `AVVideoColorPropertiesKey` was added.
+     * <p>BT.2408 puts HLG diffuse white at 75% of the signal range. It has to
+     * come out bright — that is what stops a drone clip reading a stop darker and
+     * greyer than the map it is composited into, which is how this failed on
+     * Apple before `AVVideoColorPropertiesKey` was added.
      *
-     * <p>The second assertion is what makes the first one informative: decoding
-     * the same code as if it were an ordinary SDR transfer gives roughly 198, so
-     * a test that only checked "bright" would pass with the HLG handling deleted.
+     * <p><b>It must not come out at 255.</b> An HLG signal reaches about seven
+     * and a half times diffuse white, so putting white at the ceiling leaves
+     * nowhere for any of that to go and every highlight becomes the same flat
+     * shape. Reserving headroom is what {@link #hlgHighlightsAboveWhiteStaySeparate}
+     * then has something to measure.
+     *
+     * <p>The lower bound is what makes it informative: decoding the same code as
+     * an ordinary SDR transfer gives roughly 198, so a test that only checked
+     * "bright" would pass with the HLG handling deleted.
      */
     @Test
-    public void hlgDiffuseWhiteReachesSrgbWhite() {
+    public void hlgDiffuseWhiteIsBrightButLeavesHeadroom() {
         final ClipColor hlg =
                 new ClipColor(ClipColor.STANDARD_BT2020, ClipColor.TRANSFER_HLG, false);
         final ClipColor sdr =
@@ -133,11 +139,52 @@ public class ClipColorTest {
         final int converted = red(hlg.toRgb(code, 128, 128));
         final int ignored = red(sdr.toRgb(code, 128, 128));
 
-        assertTrue("HLG diffuse white came out at " + converted + ", not near white",
-                converted >= 250);
+        assertTrue("HLG diffuse white came out at " + converted + ", not bright enough",
+                converted >= 200);
+        assertTrue("HLG diffuse white came out at " + converted + ", which is at or near "
+                        + "the ceiling — nothing above white can be shown from there",
+                converted <= 245);
         assertTrue("treating HLG as SDR gave " + ignored + ", which is not far enough"
-                        + " below " + converted + " for this test to mean anything",
-                converted - ignored >= 40);
+                        + " from " + converted + " for this test to mean anything",
+                Math.abs(converted - ignored) >= 20);
+    }
+
+    /**
+     * The property that separates a roll-off from a clamp, and the one nothing
+     * here stated for as long as this clamped.
+     *
+     * <p>Diffuse white, and three signals above it, have to arrive as four
+     * *different* values. Under the clamp they were four identical 255s: a sun
+     * and the sky behind it rendered as one shape, and the film differed from the
+     * macOS one for the same footage.
+     *
+     * <p>Nothing already in this file could fail that way. Diffuse white near
+     * white, black staying black and a monotonically rising curve are all true of
+     * a clamping implementation — true, and insufficient. That is why this test
+     * asserts separation rather than brightness.
+     */
+    @Test
+    public void hlgHighlightsAboveWhiteStaySeparate() {
+        final ClipColor hlg =
+                new ClipColor(ClipColor.STANDARD_BT2020, ClipColor.TRANSFER_HLG, false);
+
+        final double[] signals = {0.75, 0.85, 0.93, 1.0};
+        final int[] out = new int[signals.length];
+        for (int i = 0; i < signals.length; i++) {
+            out[i] = red(hlg.toRgb(limitedCode(signals[i]), 128, 128));
+        }
+
+        for (int i = 1; i < out.length; i++) {
+            assertTrue("signal " + signals[i] + " gave " + out[i] + ", the same as or below "
+                            + signals[i - 1] + " at " + out[i - 1]
+                            + " — highlights above diffuse white are being crushed together",
+                    out[i] > out[i - 1]);
+        }
+
+        assertTrue("the whole range above diffuse white spans only "
+                        + (out[out.length - 1] - out[0]) + " codes, which is not enough to "
+                        + "tell a sun from the sky behind it",
+                out[out.length - 1] - out[0] >= 8);
     }
 
     @Test
@@ -165,12 +212,15 @@ public class ClipColorTest {
 
     /**
      * PQ is normalized to BT.2408's 203 cd/m2 reference white, so the code that
-     * carries 203 nits has to come out white for the same reason HLG's diffuse
-     * white does. Nothing in the corpus is PQ; this is here so that the first
-     * file that is does not quietly come out four stops too dark.
+     * carries 203 nits has to come out bright for the same reason HLG's diffuse
+     * white does — and, for the same reason, must stop short of the ceiling.
+     * PQ runs far above reference white too, so putting 203 nits at 255 would
+     * clip every specular highlight a PQ file has. Nothing in the corpus is PQ;
+     * this is here so the first file that is comes out neither four stops too
+     * dark nor entirely white above the middle.
      */
     @Test
-    public void pqReferenceWhiteReachesSrgbWhite() {
+    public void pqReferenceWhiteIsBrightButLeavesHeadroom() {
         final ClipColor pq =
                 new ClipColor(ClipColor.STANDARD_BT2020, ClipColor.TRANSFER_PQ, false);
 
@@ -185,7 +235,11 @@ public class ClipColorTest {
         final double signal = Math.pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
 
         final int converted = red(pq.toRgb(limitedCode(signal), 128, 128));
-        assertTrue("PQ reference white came out at " + converted, converted >= 245);
+        assertTrue("PQ reference white came out at " + converted + ", too dark",
+                converted >= 200);
+        assertTrue("PQ reference white came out at " + converted + ", at the ceiling — "
+                        + "every specular highlight above it would clip to the same value",
+                converted <= 245);
     }
 
     @Test

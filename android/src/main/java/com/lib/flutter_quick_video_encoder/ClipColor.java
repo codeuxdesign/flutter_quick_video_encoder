@@ -22,12 +22,20 @@ package com.lib.flutter_quick_video_encoder;
  * keeping the boundary sharp: {@link ClipReader} owns the codec, this owns the
  * math.
  *
- * <p><b>Highlights clip rather than roll off.</b> An HLG signal above diffuse
- * white has nowhere to go in an 8-bit sRGB frame, and the choice here is to
- * clamp — which is what AVFoundation does on the reference platform. A soft
- * shoulder would look better on a bright sky and would also make the Android
- * film differ from the macOS one for reasons unrelated to this work. If a tone
- * map is ever wanted it should be added to both platforms at once.
+ * <p><b>Highlights roll off rather than clip, and the previous note here was
+ * wrong about why.</b> It said clamping "is what AVFoundation does on the
+ * reference platform". Nobody had put a frame beside it. AVFoundation rolls off:
+ * converting one 4K HLG drone frame both ways gave mean RGB 66/69/69 for
+ * AVFoundation against 92/97/92 here, and the average understated it — Apple
+ * kept the sun as a disc against a blue sky while this clamped both to one flat
+ * white shape.
+ *
+ * <p>Worth keeping as a caution about the tests, not just the code. The HLG
+ * cases assert that diffuse white lands near white, that black stays black and
+ * that the curve rises monotonically. All three are true of a clamping
+ * implementation. There was no missing assertion — the property that separates
+ * rolled-off from clipped was simply never stated, and only two frames side by
+ * side surfaced it.
  */
 final class ClipColor {
 
@@ -41,8 +49,40 @@ final class ClipColor {
     static final int TRANSFER_HLG = 2;
     static final int TRANSFER_PQ = 3;
 
+    /**
+     * Where the converted picture is going.
+     *
+     * <p>**A parameter rather than a hardcoded return type**, because it is the
+     * one decision that is cheap to make now and a refactor to make later. Only
+     * {@link #OUTPUT_SDR_REC709} is implemented; the HLG constant exists so the
+     * seam is real and so an unimplemented path fails loudly instead of quietly
+     * producing SDR pixels under an HDR label.
+     */
+    static final int OUTPUT_SDR_REC709 = 1;
+    static final int OUTPUT_HLG_BT2020 = 2;
+
     /** Nominal peak of an HLG display, and the gamma that follows from it. */
     private static final double HLG_GAMMA = 1.2;
+
+    /**
+     * Where diffuse white lands in the SDR output, and where the roll-off starts.
+     *
+     * <p><b>These two numbers are the whole highlight decision, and the first one
+     * has to be below 1.0 for the second to mean anything.</b> After the OOTF an
+     * HLG signal runs from 0 to {@code hlgScale}, which works out near 7.5 — so
+     * the picture carries seven and a half times diffuse white. Mapping diffuse
+     * white to 1.0, as this did, leaves *nothing* above it and every highlight
+     * becomes the same flat white: a sun and the sky behind it render as one
+     * shape. Reserving headroom is not a stylistic preference, it is the only way
+     * the range above white can be shown at all, and it is why a correct HDR→SDR
+     * render looks slightly darker than a clipped one rather than brighter.
+     *
+     * <p>Measured against AVFoundation converting the same drone frame, which
+     * reserves headroom the same way and is why its mean sat at 66 against our
+     * 92 while its sun stayed a disc.
+     */
+    private static final float SDR_DIFFUSE_TARGET = 0.75f;
+    private static final float SDR_KNEE = 0.6f;
 
     /**
      * The signal level BT.2408 calls HLG reference white. Mapping it to sRGB
@@ -79,6 +119,15 @@ final class ClipColor {
     final int standard;
     final int transfer;
     final boolean fullRange;
+    final int outputSpace;
+
+    /**
+     * Whether anything can exceed diffuse white, and so whether a roll-off runs.
+     *
+     * <p>False for an SDR source, where the signal cannot go above white and a
+     * roll-off would only darken a picture that was already correct.
+     */
+    private final boolean compressHighlights;
 
     /**
      * Whether the samples need the float pipeline rather than a matrix.
@@ -114,10 +163,23 @@ final class ClipColor {
     private float lumaB;
 
     ClipColor(int standard, int transfer, boolean fullRange) {
+        this(standard, transfer, fullRange, OUTPUT_SDR_REC709);
+    }
+
+    ClipColor(int standard, int transfer, boolean fullRange, int outputSpace) {
         this.standard = standard;
         this.transfer = transfer;
         this.fullRange = fullRange;
+        this.outputSpace = outputSpace;
+        if (outputSpace != OUTPUT_SDR_REC709) {
+            // Loudly, rather than returning SDR pixels that something upstream
+            // will label BT.2020 HLG. A film tagged as HDR and carrying SDR
+            // samples is the shape of defect this file exists to prevent.
+            throw new IllegalArgumentException(
+                    "output space " + outputSpace + " is declared but not implemented");
+        }
         this.wideGamutOrHdr = standard == STANDARD_BT2020 || transfer != TRANSFER_SDR;
+        this.compressHighlights = transfer != TRANSFER_SDR;
 
         final double kr = standard == STANDARD_BT601 ? 0.299
                 : standard == STANDARD_BT2020 ? 0.2627 : 0.2126;
@@ -246,6 +308,22 @@ final class ClipColor {
             b *= gain;
         }
 
+        if (compressHighlights) {
+            // **On luminance, scaling all three channels together — not per
+            // channel.** Rolling each channel off on its own changes the ratios
+            // between them, so a bright saturated area drifts in hue as it
+            // brightens and a sunset goes yellow at the edges. Scaling by a
+            // single factor moves the pixel along its own colour, which is what
+            // makes the highlight recover detail rather than change shade.
+            final float luminance = lumaR * r + lumaG * g + lumaB * b;
+            if (luminance > 0.0f) {
+                final float gain = rolledOff(luminance) / luminance;
+                r *= gain;
+                g *= gain;
+                b *= gain;
+            }
+        }
+
         if (standard == STANDARD_BT2020) {
             final float lr = r;
             final float lg = g;
@@ -259,6 +337,30 @@ final class ClipColor {
         }
 
         return (srgbByte(r) << 16) | (srgbByte(g) << 8) | srgbByte(b);
+    }
+
+    /**
+     * Display luminance after the highlight roll-off, still linear.
+     *
+     * <p>Diffuse white arrives here as 1.0 and the brightest an HLG signal can
+     * reach is about 7.5. The curve scales by {@link #SDR_DIFFUSE_TARGET} first,
+     * so white sits below the ceiling and there is somewhere for the rest to go,
+     * then bends what is left asymptotically towards 1.0.
+     *
+     * <p>{@code k + (1-k)(1 - e^-((s-k)/(1-k)))} is chosen for three properties
+     * rather than for its shape: it passes through the knee exactly, its slope
+     * there is exactly one — so nothing below the knee is disturbed and nothing
+     * kinks at it — and it approaches 1.0 without ever reaching it, so no input,
+     * however bright, can clip. A curve that clipped at some large value would
+     * reintroduce the original defect for a bright enough sky.
+     */
+    private static float rolledOff(float displayLinear) {
+        final float s = displayLinear * SDR_DIFFUSE_TARGET;
+        if (s <= SDR_KNEE) {
+            return s;
+        }
+        final float head = 1.0f - SDR_KNEE;
+        return SDR_KNEE + head * (float) (1.0 - Math.exp(-(s - SDR_KNEE) / head));
     }
 
     private int srgbByte(float linear) {
