@@ -34,6 +34,10 @@ struct FQVEClipColor {
     BOOL wideGamutOrHdr;
     BOOL compressHighlights;
 
+    // Integer path, 16.16 fixed point, one table per input code. Ordinary
+    // Rec.709 and Rec.601 video takes this and never reaches linear light.
+    int32_t *iY, *iRfromV, *iGfromV, *iGfromU, *iBfromU;  // 1024 each
+
     float *wY, *wRfromV, *wGfromV, *wGfromU, *wBfromU;   // 1024 each
     float *toLinear;                                      // kLinearLut
     float *ootfGain;                                      // kGainLut
@@ -122,6 +126,25 @@ FQVEClipColor *FQVEClipColorCreate(FQVEStandard standard,
     const double gu = -2.0 * (1.0 - kb) * kb / kg;
 
     const int codes = 1024;
+
+    // Built unconditionally, exactly as the Java side builds them, because the
+    // two have to agree bit for bit and the cheapest way to guarantee that is to
+    // run the same arithmetic rather than an equivalent one.
+    c->iY = malloc(sizeof(int32_t) * codes);
+    c->iRfromV = malloc(sizeof(int32_t) * codes);
+    c->iGfromV = malloc(sizeof(int32_t) * codes);
+    c->iGfromU = malloc(sizeof(int32_t) * codes);
+    c->iBfromU = malloc(sizeof(int32_t) * codes);
+    for (int i = 0; i < codes; i++) {
+        const double y = (i - yOffset) * yScale;
+        const double ch = (i - kChromaCentre) * cScale;
+        c->iY[i] = (int32_t)llround(y * 255.0 * 65536.0);
+        c->iRfromV[i] = (int32_t)llround(ch * rv * 255.0 * 65536.0);
+        c->iBfromU[i] = (int32_t)llround(ch * bu * 255.0 * 65536.0);
+        c->iGfromV[i] = (int32_t)llround(ch * gv * 255.0 * 65536.0);
+        c->iGfromU[i] = (int32_t)llround(ch * gu * 255.0 * 65536.0);
+    }
+
     c->wY = malloc(sizeof(float) * codes);
     c->wRfromV = malloc(sizeof(float) * codes);
     c->wGfromV = malloc(sizeof(float) * codes);
@@ -200,11 +223,18 @@ FQVEClipColor *FQVEClipColorCreate(FQVEStandard standard,
 
 void FQVEClipColorRelease(FQVEClipColor *c) {
     if (!c) { return; }
+    free(c->iY); free(c->iRfromV); free(c->iGfromV); free(c->iGfromU); free(c->iBfromU);
     free(c->wY); free(c->wRfromV); free(c->wGfromV); free(c->wGfromU); free(c->wBfromU);
     free(c->toLinear); free(c->ootfGain);
     free(c->gammaEncode24); free(c->gammaDecode24); free(c->lumaToneMap);
     free(c->toSrgbLow); free(c->toSrgbHigh);
     free(c);
+}
+
+/// A 16.16 sum, shifted down and pinned to a byte — `ClipColor.clamp255`.
+static inline int ClampByte(int32_t v) {
+    if (v < 0) { return 0; }
+    return v > 255 ? 255 : (int)v;
 }
 
 static inline float Clamp01(float v) {
@@ -232,6 +262,32 @@ uint32_t FQVEClipColorToRgb(const FQVEClipColor *c, int y, int cb, int cr) {
     if (y < 0) { y = 0; } else if (y > 1023) { y = 1023; }
     if (cb < 0) { cb = 0; } else if (cb > 1023) { cb = 1023; }
     if (cr < 0) { cr = 0; } else if (cr > 1023) { cr = 1023; }
+
+    // **Ordinary Rec.709 and Rec.601 video is a matrix and nothing else.**
+    //
+    // This branch existed on the Java side from the beginning and was missing
+    // here — `wideGamutOrHdr` was computed with the identical expression two
+    // hundred lines up and then never read, so every clip fell through to the
+    // float path. For an SDR source that meant decoding the signal with Rec.709's
+    // *camera* inverse OETF and then re-encoding it with sRGB's *display* curve,
+    // which double-counts a transfer: the two are not inverses, and the round
+    // trip lifts shadows and midtones by up to sixteen codes, +12 at mid gray,
+    // converging only at white. Every ordinary clip came out of an iPhone
+    // visibly flatter than the same clip out of a Galaxy, with nothing to say so.
+    //
+    // It hid because the one frame the two implementations were ever compared on
+    // was HDR, which takes the float path on both platforms and therefore agrees.
+    // The pairing that diverges is the one that comparison could not reach.
+    //
+    // Treating the signal as already display-encoded is the right answer as well
+    // as the Java one: the composite blends these pixels straight into an sRGB
+    // overlay, so sRGB space is where they need to arrive.
+    if (!c->wideGamutOrHdr) {
+        const int32_t base = c->iY[y];
+        return ((uint32_t)ClampByte((base + c->iRfromV[cr]) >> 16) << 16)
+             | ((uint32_t)ClampByte((base + c->iGfromU[cb] + c->iGfromV[cr]) >> 16) << 8)
+             |  (uint32_t)ClampByte((base + c->iBfromU[cb]) >> 16);
+    }
 
     const float base = c->wY[y];
     float r = Clamp01(base + c->wRfromV[cr]);
