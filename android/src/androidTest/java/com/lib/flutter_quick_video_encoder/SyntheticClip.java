@@ -1,5 +1,6 @@
 package com.lib.flutter_quick_video_encoder;
 
+import android.media.Image;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
@@ -18,7 +19,9 @@ import java.nio.ByteBuffer;
  * a thing you squint at into an assertion.
  *
  * <p>Flat frames also survive H.264 essentially intact, which keeps the test
- * about the reader rather than about the encoder's rate control.
+ * about the reader rather than about the encoder's rate control — and they cost
+ * three bytes to describe, so a 4K clip for the benchmark is as cheap to build
+ * as a thumbnail.
  */
 final class SyntheticClip {
 
@@ -49,17 +52,37 @@ final class SyntheticClip {
     private SyntheticClip() {
     }
 
+    /** True when this device can encode [mime] at all, so a test can say why it skipped. */
+    static boolean canEncode(String mime) {
+        try {
+            final MediaCodec probe = MediaCodec.createEncoderByType(mime);
+            probe.release();
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    static void write(File target, int standard, int transfer, int range) throws Exception {
+        write(target, "video/avc", standard, transfer, range);
+    }
+
+    static void write(File target, String mime, int standard, int transfer, int range)
+            throws Exception {
+        write(target, mime, WIDTH, HEIGHT, FRAMES, standard, transfer, range);
+    }
+
     /**
-     * Encodes [FRAMES] frames of flat gray into an mp4 at [target].
+     * Encodes [frames] frames of flat gray into an mp4 at [target].
      *
      * <p>[standard], [transfer] and [range] are written into the encoder's format
      * so the reader has something to read back. Whether they survive the encoder
      * and the muxer is a property of the platform, not of this code, which is
      * exactly why a test asks rather than assumes.
      */
-    static void write(File target, int standard, int transfer, int range) throws Exception {
-        final MediaFormat format =
-                MediaFormat.createVideoFormat("video/avc", WIDTH, HEIGHT);
+    static void write(File target, String mime, int width, int height, int frames,
+                      int standard, int transfer, int range) throws Exception {
+        final MediaFormat format = MediaFormat.createVideoFormat(mime, width, height);
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
         format.setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000);
@@ -71,7 +94,7 @@ final class SyntheticClip {
         format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, transfer);
         format.setInteger(MediaFormat.KEY_COLOR_RANGE, range);
 
-        final MediaCodec encoder = MediaCodec.createEncoderByType("video/avc");
+        final MediaCodec encoder = MediaCodec.createEncoderByType(mime);
         MediaMuxer muxer = null;
         try {
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
@@ -90,14 +113,15 @@ final class SyntheticClip {
                 if (!inputDone) {
                     final int index = encoder.dequeueInputBuffer(10_000);
                     if (index >= 0) {
-                        if (queued == FRAMES) {
+                        if (queued == frames) {
                             encoder.queueInputBuffer(index, 0, 0,
                                     frameTimeUs(queued),
                                     MediaCodec.BUFFER_FLAG_END_OF_STREAM);
                             inputDone = true;
                         } else {
-                            fillGray(encoder, index, grayOf(queued));
-                            encoder.queueInputBuffer(index, 0, bufferSize(encoder, index),
+                            fillGray(encoder, index, grayOf(queued), width, height);
+                            encoder.queueInputBuffer(index, 0,
+                                    encoder.getInputBuffer(index).capacity(),
                                     frameTimeUs(queued), 0);
                             queued++;
                         }
@@ -144,36 +168,40 @@ final class SyntheticClip {
         return index * 1_000_000L / FPS;
     }
 
-    private static int bufferSize(MediaCodec encoder, int index) {
-        return encoder.getInputBuffer(index).capacity();
-    }
-
-    private static void fillGray(MediaCodec encoder, int index, int gray) {
-        final byte[] rgba = new byte[WIDTH * HEIGHT * 4];
-        for (int i = 0; i < WIDTH * HEIGHT; i++) {
-            rgba[i * 4] = (byte) gray;
-            rgba[i * 4 + 1] = (byte) gray;
-            rgba[i * 4 + 2] = (byte) gray;
-            rgba[i * 4 + 3] = (byte) 255;
+    /**
+     * Writes one flat gray into the encoder's input planes.
+     *
+     * <p>The three sample values come from {@link FrameYuv} once, on a
+     * two-by-two frame, rather than by converting a full-size RGBA buffer — a 4K
+     * frame that way is thirty-three megabytes of allocation per frame to
+     * describe a single color.
+     */
+    private static void fillGray(MediaCodec encoder, int index, int gray,
+                                 int width, int height) {
+        final byte[] tiny = new byte[2 * 2 * 4];
+        for (int i = 0; i < 4; i++) {
+            tiny[i * 4] = (byte) gray;
+            tiny[i * 4 + 1] = (byte) gray;
+            tiny[i * 4 + 2] = (byte) gray;
+            tiny[i * 4 + 3] = (byte) 255;
         }
-        final byte[] yuv = FrameYuv.toYuv420Planar(rgba, WIDTH, HEIGHT);
+        final byte[] yuv = FrameYuv.toYuv420Planar(tiny, 2, 2);
 
-        final android.media.Image image = encoder.getInputImage(index);
-        final android.media.Image.Plane[] planes = image.getPlanes();
-        writePlane(planes[0], yuv, 0, WIDTH, HEIGHT);
-        writePlane(planes[1], yuv, WIDTH * HEIGHT, WIDTH / 2, HEIGHT / 2);
-        writePlane(planes[2], yuv, WIDTH * HEIGHT + WIDTH * HEIGHT / 4,
-                WIDTH / 2, HEIGHT / 2);
+        final Image image = encoder.getInputImage(index);
+        final Image.Plane[] planes = image.getPlanes();
+        fillPlane(planes[0], yuv[0], width, height);
+        fillPlane(planes[1], yuv[4], width / 2, height / 2);
+        fillPlane(planes[2], yuv[5], width / 2, height / 2);
     }
 
-    private static void writePlane(android.media.Image.Plane plane, byte[] source,
-                                   int offset, int width, int height) {
+    private static void fillPlane(Image.Plane plane, byte value, int width, int height) {
         final ByteBuffer buffer = plane.getBuffer();
         final int rowStride = plane.getRowStride();
         final int pixelStride = plane.getPixelStride();
         for (int y = 0; y < height; y++) {
+            final int base = y * rowStride;
             for (int x = 0; x < width; x++) {
-                buffer.put(y * rowStride + x * pixelStride, source[offset + y * width + x]);
+                buffer.put(base + x * pixelStride, value);
             }
         }
     }

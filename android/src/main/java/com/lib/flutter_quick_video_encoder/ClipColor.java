@@ -56,7 +56,25 @@ final class ClipColor {
 
     private static final int LINEAR_LUT = 1024;
     private static final int GAIN_LUT = 4096;
-    private static final int ENCODE_LUT = 4096;
+
+    /**
+     * The sRGB encode is two tables, not one, and the split is a measurement.
+     *
+     * <p>One table indexed by the square root of the linear value crowds its
+     * entries near black where sRGB is steepest, which is correct and costs a
+     * {@code Math.sqrt} per channel — three per pixel, two million pixels a
+     * frame. Measured on a Galaxy S24 Ultra compositing a 4K clip into
+     * 1080x1920, that and the float traffic around it came to 400 ms a frame on
+     * top of the decode.
+     *
+     * <p>Two linearly indexed tables get the same precision for a compare and a
+     * multiply: a fine one over the shadows, where a step of one part in
+     * a hundred thousand keeps quantization under a thirtieth of a code, and a
+     * coarse one over everything above.
+     */
+    private static final float ENCODE_SPLIT = 0.02f;
+    private static final int ENCODE_LOW_LUT = 2048;
+    private static final int ENCODE_HIGH_LUT = 4096;
 
     final int standard;
     final int transfer;
@@ -88,7 +106,8 @@ final class ClipColor {
     private float[] wBfromU;
     private float[] toLinear;
     private float[] ootfGain;
-    private byte[] toSrgb;
+    private byte[] toSrgbLow;
+    private byte[] toSrgbHigh;
     private float hlgScale;
     private float lumaR;
     private float lumaG;
@@ -179,13 +198,16 @@ final class ClipColor {
             hlgScale = (float) (1.0 / display);
         }
 
-        // Indexed by the square root of the linear value, so the entries crowd
-        // together near black where sRGB is steepest. Indexing linearly would
-        // quantize the shadows into visible bands.
-        toSrgb = new byte[ENCODE_LUT];
-        for (int i = 0; i < ENCODE_LUT; i++) {
-            final double u = (double) i / (ENCODE_LUT - 1);
-            toSrgb[i] = (byte) Math.round(255.0 * srgbEncode(u * u));
+        toSrgbLow = new byte[ENCODE_LOW_LUT];
+        for (int i = 0; i < ENCODE_LOW_LUT; i++) {
+            final double x = ENCODE_SPLIT * i / (ENCODE_LOW_LUT - 1);
+            toSrgbLow[i] = (byte) Math.round(255.0 * srgbEncode(x));
+        }
+        toSrgbHigh = new byte[ENCODE_HIGH_LUT];
+        for (int i = 0; i < ENCODE_HIGH_LUT; i++) {
+            final double x = ENCODE_SPLIT
+                    + (1.0 - ENCODE_SPLIT) * i / (ENCODE_HIGH_LUT - 1);
+            toSrgbHigh[i] = (byte) Math.round(255.0 * srgbEncode(x));
         }
     }
 
@@ -246,8 +268,12 @@ final class ClipColor {
         if (linear >= 1.0f) {
             return 255;
         }
-        final int index = (int) (Math.sqrt(linear) * (ENCODE_LUT - 1) + 0.5f);
-        return toSrgb[index] & 0xFF;
+        if (linear < ENCODE_SPLIT) {
+            return toSrgbLow[(int) (linear * ((ENCODE_LOW_LUT - 1) / ENCODE_SPLIT) + 0.5f)]
+                    & 0xFF;
+        }
+        return toSrgbHigh[(int) ((linear - ENCODE_SPLIT)
+                * ((ENCODE_HIGH_LUT - 1) / (1.0f - ENCODE_SPLIT)) + 0.5f)] & 0xFF;
     }
 
     private double signalToLinear(double signal) {

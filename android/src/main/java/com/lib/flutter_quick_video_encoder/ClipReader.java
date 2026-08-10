@@ -443,11 +443,29 @@ final class ClipReader {
             return;
         }
 
+        // Semiplanar chroma, or 10-bit, or both. Each row is bulk-copied first
+        // and gathered afterwards in plain array space, rather than reading the
+        // direct buffer a byte at a time: a bulk get is a memcpy, while
+        // `ByteBuffer.get(int)` on a direct buffer is a bounds-checked access
+        // that the JIT will not turn into one. This is the path a real phone
+        // takes — the Galaxy S24 Ultra reports a chroma pixel stride of 2 — so
+        // it is worth the scratch row.
+        final int span = (width - 1) * pixelStride + 1 + sampleOffset;
+        final byte[] row = new byte[span];
         for (int y = 0; y < height; y++) {
-            final int base = (top + y) * rowStride + left * pixelStride + sampleOffset;
+            final int base = (top + y) * rowStride + left * pixelStride;
             final int dst = y * width;
-            for (int x = 0; x < width; x++) {
-                out[dst + x] = buffer.get(base + x * pixelStride);
+            if (base + span <= buffer.limit()) {
+                buffer.position(base);
+                buffer.get(row, 0, span);
+                for (int x = 0; x < width; x++) {
+                    out[dst + x] = row[x * pixelStride + sampleOffset];
+                }
+            } else {
+                // The final row of a plane can stop short of a full stride.
+                for (int x = 0; x < width; x++) {
+                    out[dst + x] = buffer.get(base + x * pixelStride + sampleOffset);
+                }
             }
         }
     }
