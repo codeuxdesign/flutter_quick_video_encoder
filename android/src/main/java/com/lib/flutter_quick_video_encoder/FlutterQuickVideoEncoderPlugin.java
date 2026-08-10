@@ -796,49 +796,11 @@ public class FlutterQuickVideoEncoderPlugin implements
 
     private void fillImage(Image image, byte[] yuv420, int width, int height) {
         Image.Plane[] planes = image.getPlanes();
-
-        // Fill Y plane
-        ByteBuffer yBuffer = planes[0].getBuffer();
-        int yRowStride = planes[0].getRowStride();
-        int yPixelStride = planes[0].getPixelStride();
-        int yOffset = 0;
-        for (int i = 0; i < height; i++) {
-            int yPos = i * yRowStride;
-            yBuffer.position(yPos);
-            for (int j = 0; j < width; j++) {
-                yBuffer.put(yPos + j * yPixelStride, yuv420[yOffset++]);
-            }
-        }
-
-        // Fill U plane
-        ByteBuffer uBuffer = planes[1].getBuffer();
-        int uRowStride = planes[1].getRowStride();
-        int uPixelStride = planes[1].getPixelStride();
-        int uHeight = height / 2;
-        int uWidth = width / 2;
-        int uOffset = width * height;
-        for (int i = 0; i < uHeight; i++) {
-            int uPos = i * uRowStride;
-            uBuffer.position(uPos);
-            for (int j = 0; j < uWidth; j++) {
-                uBuffer.put(uPos + j * uPixelStride, yuv420[uOffset++]);
-            }
-        }
-
-        // Fill V plane
-        ByteBuffer vBuffer = planes[2].getBuffer();
-        int vRowStride = planes[2].getRowStride();
-        int vPixelStride = planes[2].getPixelStride();
-        int vHeight = height / 2;
-        int vWidth = width / 2;
-        int vOffset = width * height + (width / 2) * (height / 2);
-        for (int i = 0; i < vHeight; i++) {
-            int vPos = i * vRowStride;
-            vBuffer.position(vPos);
-            for (int j = 0; j < vWidth; j++) {
-                vBuffer.put(vPos + j * vPixelStride, yuv420[vOffset++]);
-            }
-        }
+        FrameYuv.fillPlanes(
+                yuv420, width, height,
+                planes[0].getBuffer(), planes[0].getRowStride(), planes[0].getPixelStride(),
+                planes[1].getBuffer(), planes[1].getRowStride(), planes[1].getPixelStride(),
+                planes[2].getBuffer(), planes[2].getRowStride(), planes[2].getPixelStride());
     }
 
     private int getColorFormat() {

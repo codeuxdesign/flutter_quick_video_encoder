@@ -1,5 +1,7 @@
 package com.lib.flutter_quick_video_encoder;
 
+import java.nio.ByteBuffer;
+
 /**
  * The rendered frame on its way into the encoder: RGBA to planar YUV 4:2:0.
  *
@@ -53,8 +55,22 @@ final class FrameYuv {
      * said "this rectangle belongs to a clip" is gone.
      */
     static byte[] toYuv420Planar(byte[] rgba, int width, int height) {
+        return toYuv420Planar(rgba, width, height, null);
+    }
+
+    /**
+     * As above, into [reuse] when it is the right size.
+     *
+     * <p>A 1080x1920 frame is three megabytes of planes, and a full film is
+     * 4339 of them — thirteen gigabytes handed to the collector to describe
+     * pictures that are each thrown away a millisecond later. The encoder feeds
+     * one frame at a time, so one buffer is enough.
+     */
+    static byte[] toYuv420Planar(byte[] rgba, int width, int height, byte[] reuse) {
         final int frameSize = width * height;
-        final byte[] out = new byte[frameSize * 3 / 2];
+        final int needed = frameSize * 3 / 2;
+        final byte[] out = reuse != null && reuse.length == needed
+                ? reuse : new byte[needed];
 
         int yIndex = 0;
         int uIndex = frameSize;
@@ -80,6 +96,53 @@ final class FrameYuv {
         }
 
         return out;
+    }
+
+    /**
+     * Copies planar I420 into an encoder's input planes, bulk by row.
+     *
+     * <p><b>Row at a time, not sample at a time.</b> This was three million
+     * `ByteBuffer.put(index, byte)` calls per 1080x1920 frame — one per luma
+     * sample and one per chroma sample — and each is a bounds-checked access on
+     * a direct buffer that the JIT will not fold into a copy. The same shape
+     * cost half the clip compositor's budget until it was measured; see
+     * `ClipReader.copyPlane`, which is the mirror image of this on the way in.
+     *
+     * <p>Takes buffers and strides rather than an `Image` so it can be measured
+     * and tested without a codec. An encoder's input is normally planar with a
+     * pixel stride of one, which is the bulk path; the per-sample loop stays for
+     * the semiplanar encoders that exist.
+     */
+    static void fillPlanes(byte[] yuv420, int width, int height,
+                           ByteBuffer y, int yRowStride, int yPixelStride,
+                           ByteBuffer u, int uRowStride, int uPixelStride,
+                           ByteBuffer v, int vRowStride, int vPixelStride) {
+        final int frameSize = width * height;
+        final int chromaWidth = width / 2;
+        final int chromaHeight = height / 2;
+        writePlane(y, yRowStride, yPixelStride, yuv420, 0, width, height);
+        writePlane(u, uRowStride, uPixelStride, yuv420, frameSize,
+                chromaWidth, chromaHeight);
+        writePlane(v, vRowStride, vPixelStride, yuv420,
+                frameSize + chromaWidth * chromaHeight, chromaWidth, chromaHeight);
+    }
+
+    private static void writePlane(ByteBuffer dst, int rowStride, int pixelStride,
+                                   byte[] src, int offset, int width, int height) {
+        if (pixelStride == 1) {
+            for (int row = 0; row < height; row++) {
+                dst.position(row * rowStride);
+                dst.put(src, offset + row * width, width);
+            }
+            return;
+        }
+        for (int row = 0; row < height; row++) {
+            final int base = row * rowStride;
+            final int from = offset + row * width;
+            for (int col = 0; col < width; col++) {
+                dst.put(base + col * pixelStride, src[from + col]);
+            }
+        }
     }
 
     private static byte clamp(int value) {
