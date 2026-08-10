@@ -130,17 +130,33 @@ static void blendClipIntoFrame(uint8_t *dst, int frameWidth, int frameHeight,
 @property(nonatomic) AVAssetReaderTrackOutput *output;
 @property(nonatomic) CVPixelBufferRef current;
 @property(nonatomic) CMTime currentEnd;
+- (instancetype)initWithPath:(NSString *)path reason:(NSString **)reason;
 @end
 
 @implementation FQVEClipReader
 
 - (instancetype)initWithPath:(NSString *)path {
+    return [self initWithPath:path reason:NULL];
+}
+
+/// As above, but says which step refused.
+///
+/// **The decodability check has to open a clip the same way the render does.**
+/// A checker that reimplements these steps can answer "fine" for a file the
+/// real reader then refuses, and the render's own behaviour for a refused clip
+/// is to leave the rectangle as the painter cleared it — so the disagreement
+/// ships as a black window in a published film rather than as an error. One
+/// initialiser with an optional reason, rather than two openers that can drift.
+- (instancetype)initWithPath:(NSString *)path reason:(NSString **)reason {
     self = [super init];
     if (!self) { return nil; }
 
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
     AVAssetTrack *track = FQVEFirstTrack(asset, AVMediaTypeVideo);
-    if (!track) { return nil; }
+    if (!track) {
+        if (reason) { *reason = @"no video track, or its tracks did not load"; }
+        return nil;
+    }
 
     NSError *error = nil;
     // **Named on `self`, not just captured locally.** A reader that outlives
@@ -149,7 +165,12 @@ static void blendClipIntoFrame(uint8_t *dst, int frameWidth, int frameHeight,
     // where no `@try` reaches it and the app dies rather than returning an
     // error. That exact bug has been paid for once in this file already.
     self.reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
-    if (!self.reader) { return nil; }
+    if (!self.reader) {
+        if (reason) {
+            *reason = error.localizedDescription ?: @"could not open a reader";
+        }
+        return nil;
+    }
 
     self.output = [[AVAssetReaderTrackOutput alloc]
         initWithTrack:track
@@ -162,9 +183,17 @@ static void blendClipIntoFrame(uint8_t *dst, int frameWidth, int frameHeight,
            },
        }];
     self.output.alwaysCopiesSampleData = NO;
-    if (![self.reader canAddOutput:self.output]) { return nil; }
+    if (![self.reader canAddOutput:self.output]) {
+        if (reason) { *reason = @"this device cannot decode it to BGRA"; }
+        return nil;
+    }
     [self.reader addOutput:self.output];
-    if (![self.reader startReading]) { return nil; }
+    if (![self.reader startReading]) {
+        if (reason) {
+            *reason = self.reader.error.localizedDescription ?: @"could not start reading";
+        }
+        return nil;
+    }
 
     self.currentEnd = kCMTimeZero;
     return self;
@@ -325,6 +354,47 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         if ([@"thermalStatus" isEqualToString:call.method])
         {
             result(currentThermalState());
+        }
+        else if ([@"checkClipsDecodable" isEqualToString:call.method])
+        {
+            // Asked *before* a render rather than discovered inside one. A
+            // refusal that arrives four thousand frames in is a refusal that
+            // arrives after the waiting.
+            //
+            // Answers with a map of path to reason, empty when every clip
+            // opened and produced a frame. Named paths rather than a count,
+            // because the message a rider needs is which of *their* files this
+            // device cannot read.
+            //
+            // Implemented on Apple as well as Android even though AVFoundation
+            // refuses far less often, because a check that exists on one
+            // platform makes "every clip is fine" and "nobody asked" the same
+            // answer everywhere else — which is the shape of failure this call
+            // was added to remove.
+            NSDictionary *args = (NSDictionary *)call.arguments;
+            NSArray *paths = args[@"paths"];
+            NSMutableDictionary<NSString *, NSString *> *failures =
+                [NSMutableDictionary dictionary];
+            for (id item in (paths ?: @[])) {
+                if (![item isKindOfClass:[NSString class]]) { continue; }
+                NSString *path = (NSString *)item;
+                NSString *reason = nil;
+                FQVEClipReader *probe = [[FQVEClipReader alloc] initWithPath:path
+                                                                      reason:&reason];
+                if (!probe) {
+                    failures[path] = reason ?: @"could not be opened";
+                } else if (![probe frameAtTime:kCMTimeZero]) {
+                    // Opening is not reading. A file whose header parses and
+                    // whose first sample does not decode is exactly the case
+                    // that would otherwise reach the compositor and encode as a
+                    // black window with nothing logged.
+                    failures[path] = @"opened but decoded no frame";
+                }
+                if (failures[path]) {
+                    NSLog(@"FQVE: CLIP cannot decode %@: %@", path, failures[path]);
+                }
+            }
+            result(failures);
         }
         else if ([@"setLogLevel" isEqualToString:call.method])
         {

@@ -150,6 +150,52 @@ class FlutterQuickVideoEncoder {
     });
   }
 
+  /// Which of [paths] this device cannot decode, and why.
+  ///
+  /// Keyed by path, empty when every clip opened and produced a frame. Named
+  /// paths rather than a count, because the message a rider needs is which of
+  /// *their* files this device cannot read.
+  ///
+  /// **Ask before the render, not during it.** A clip that cannot be opened is
+  /// not an error at export time: the compositor's documented behavior is to
+  /// leave that rectangle as the painter cleared it, which encodes as a black
+  /// window in a film that is otherwise valid, with nothing logged. So the
+  /// alternative to calling this is not a late failure, it is a published
+  /// video with a hole in it.
+  ///
+  /// It opens each clip exactly the way the render does and decodes **one**
+  /// frame, so it costs a decoder start per clip — cheap next to an export, and
+  /// worth it in the second before the button rather than four minutes after
+  /// it.
+  ///
+  /// **One frame is the limit of what it promises, and that is a real limit.**
+  /// Measured on macOS: zeroing 200 KB out of the middle of a 431 KB mp4 —
+  /// close to half the file — still answers decodable, because the first frame
+  /// is intact and nothing reads further. So this catches a file that is not a
+  /// video, that has no video track, or whose codec this device cannot decode
+  /// at all; it does not catch damage past the opening. A full integrity pass
+  /// would cost a complete decode of every clip, which is the export itself.
+  ///
+  /// Both platforms answer. It neither subsumes nor is subsumed by an existence
+  /// or byte-length check: a truncated file fails here *and* fails those, while
+  /// a file damaged in the middle passes here and passes those. They are
+  /// different questions and both are worth asking.
+  static Future<Map<String, String>> checkClipsDecodable(
+    List<String> paths,
+  ) async {
+    if (paths.isEmpty) {
+      return const {};
+    }
+    final result = await _invokeMethod<Map<Object?, Object?>>(
+      'checkClipsDecodable',
+      {'paths': paths},
+    );
+    return {
+      for (final entry in (result ?? const {}).entries)
+        entry.key.toString(): entry.value.toString(),
+    };
+  }
+
   /// append raw pcm audio samples
   ///  - 16 bit, little-endiant
   ///  - when using stereo audio, samples should be interleaved left channel first
