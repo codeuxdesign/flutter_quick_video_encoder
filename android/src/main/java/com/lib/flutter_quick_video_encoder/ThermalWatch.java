@@ -159,17 +159,31 @@ final class ThermalWatch {
      * is worth less.
      */
     private String headroomSuffix() {
+        final float headroom = currentHeadroom();
+        return Float.isNaN(headroom) ? "" : String.format(" headroom=%.2f", headroom);
+    }
+
+    /**
+     * How close the device is to throttling, where 1.0 is the threshold, or NaN.
+     *
+     * <p>The continuous companion to the status enum, and the one a rising
+     * thermometer wants: the status jumps in steps a rider would read as the
+     * gauge being broken, while this moves smoothly and reached exactly 1.00 on
+     * a Galaxy S24 Ultra at the moment it went SEVERE.
+     *
+     * <p>NaN rather than a guess when the platform declines — it is API 30 and
+     * up, it returns NaN if polled faster than about once a second, and some
+     * devices do not implement it. A gauge with no reading can be hidden; a
+     * gauge showing a made-up number cannot be unseen.
+     */
+    float currentHeadroom() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            return "";
+            return Float.NaN;
         }
         try {
-            final float headroom = power.getThermalHeadroom(0);
-            if (Float.isNaN(headroom)) {
-                return "";
-            }
-            return String.format(" headroom=%.2f", headroom);
+            return power.getThermalHeadroom(0);
         } catch (Exception e) {
-            return "";
+            return Float.NaN;
         }
     }
 

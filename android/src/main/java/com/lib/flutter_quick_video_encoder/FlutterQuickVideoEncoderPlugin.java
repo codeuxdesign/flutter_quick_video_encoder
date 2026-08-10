@@ -353,6 +353,14 @@ public class FlutterQuickVideoEncoderPlugin implements
                     thermal.put("status", status);
                     thermal.put("name", ThermalWatch.describe(status));
                     thermal.put("throttling", ThermalWatch.worthReporting(status));
+                    // The continuous one, for a gauge that has to move rather
+                    // than jump. Absent rather than invented where the platform
+                    // will not say — a gauge with no reading can be hidden, a
+                    // gauge showing a made-up number cannot be unseen.
+                    float headroom = mThermal == null ? Float.NaN : mThermal.currentHeadroom();
+                    if (!Float.isNaN(headroom)) {
+                        thermal.put("headroom", (double) headroom);
+                    }
                     result.success(thermal);
                     break;
                 }
