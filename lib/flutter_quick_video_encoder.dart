@@ -77,8 +77,48 @@ class ClipPreviewFrame {
   String toString() => 'ClipPreviewFrame(${width}x$height)';
 }
 
+/// One photograph, decoded to bounded RGBA by the platform.
+///
+/// **Carries what it is, not just what it holds.** [format] and [colorSpace]
+/// are `rgba8888` and `srgb` today and nothing else is produced — but naming
+/// them is what keeps a wider pixel from being a breaking change later. A bare
+/// `Uint8List` would have every call site silently assuming eight bits, and the
+/// day that stops being true is the day none of them say so.
+class StillFrame {
+  const StillFrame({
+    required this.rgba,
+    required this.width,
+    required this.height,
+    required this.format,
+    required this.colorSpace,
+    required this.hasGainmap,
+  });
+
+  final Uint8List rgba;
+  final int width;
+  final int height;
+
+  /// Always `rgba8888` today. See the class comment.
+  final String format;
+
+  /// Always `srgb` today.
+  final String colorSpace;
+
+  /// Whether the source carried an HDR gain map.
+  ///
+  /// Reported and unused: the still path is SDR throughout. It is here because
+  /// "does a bounded decode keep the gain map" is a question the HDR work has
+  /// to answer on a device, and asking it costs nothing now.
+  final bool hasGainmap;
+
+  @override
+  String toString() => 'StillFrame(${width}x$height $format/$colorSpace'
+      '${hasGainmap ? ' +gainmap' : ''})';
+}
+
 class FlutterQuickVideoEncoder {
-  static const MethodChannel _channel = const MethodChannel('flutter_quick_video_encoder/methods');
+  static const MethodChannel _channel =
+      const MethodChannel('flutter_quick_video_encoder/methods');
 
   static const EventChannel _thermalChannel = const EventChannel(
     'flutter_quick_video_encoder/thermal',
@@ -336,6 +376,46 @@ class FlutterQuickVideoEncoder {
   ///
   /// The cache is bounded and separate from the export's, and [setup] drops it,
   /// so a preview can never be holding the decoder an export wants.
+  /// Decodes a photograph so that neither edge exceeds [maxEdge].
+  ///
+  /// **Android only, and it is not a convenience.** Flutter cannot decode HEIF
+  /// itself, so on Android a `.heic` falls through to the platform generator —
+  /// which decodes at full resolution regardless of any `cacheWidth`, and whose
+  /// failures reach JNI as a pending exception and `abort()` the process. A
+  /// 200 MP photograph is an ~800 MB allocation for a 40-point thumbnail, and
+  /// an `OutOfMemoryError` in it is not something Dart can catch.
+  ///
+  /// Returns null on every other platform, and for any file that will not
+  /// decode. A null is the caller's cue to draw whatever it draws for a picture
+  /// it has not got — never a reason to fall back to `Image.file` on Android,
+  /// which is the thing being avoided.
+  static Future<StillFrame?> stillAt(
+    String path, {
+    required int maxEdge,
+  }) async {
+    if (maxEdge <= 0) {
+      throw ArgumentError.value(maxEdge, 'maxEdge', 'must be positive');
+    }
+    if (!Platform.isAndroid) {
+      return null;
+    }
+    final result = await _invokeMethod<Map<Object?, Object?>>('stillAt', {
+      'path': path,
+      'maxEdge': maxEdge,
+    });
+    if (result == null) {
+      return null;
+    }
+    return StillFrame(
+      rgba: result['rgba']! as Uint8List,
+      width: result['width']! as int,
+      height: result['height']! as int,
+      format: result['format']! as String,
+      colorSpace: result['colorSpace']! as String,
+      hasGainmap: result['hasGainmap'] as bool? ?? false,
+    );
+  }
+
   static Future<ClipPreviewFrame?> clipFrameAt(
     String path,
     Duration at, {
@@ -382,7 +462,8 @@ class FlutterQuickVideoEncoder {
   ///  - 16 bit, little-endiant
   ///  - when using stereo audio, samples should be interleaved left channel first
   static Future<void> appendAudioFrame(Uint8List rawPcm) async {
-    assert(rawPcm.length == (sampleRate * audioChannels * 2) / fps, "invalid data length");
+    assert(rawPcm.length == (sampleRate * audioChannels * 2) / fps,
+        "invalid data length");
     return await _invokeMethod('appendAudioFrame', {
       'rawPcm': rawPcm,
     });
@@ -440,7 +521,8 @@ class FlutterQuickVideoEncoder {
     // log args
     if (logLevel.index >= LogLevel.standard.index) {
       if (method == "appendVideoFrame") {
-        print("[FQVE] '<$method>' rawRgba: ${arguments['rawRgba'].length} bytes");
+        print(
+            "[FQVE] '<$method>' rawRgba: ${arguments['rawRgba'].length} bytes");
       } else if (method == "appendAudioFrame") {
         print("[FQVE] '<$method>' rawPcm: ${arguments['rawPcm'].length} bytes");
       } else {

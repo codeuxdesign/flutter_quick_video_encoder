@@ -95,6 +95,7 @@ public class FlutterQuickVideoEncoderPlugin implements
      * so a screen that forgot to let go cannot starve the film of a decoder.
      */
     private ClipPreviewCache mClipPreviews;
+    private StillDecoder mStillDecoder;
 
     /**
      * Says when the phone starts throttling, so a slower render has a reason
@@ -188,6 +189,10 @@ public class FlutterQuickVideoEncoderPlugin implements
     private void releaseClipPreviews() {
         if (mClipPreviews != null) {
             mClipPreviews.release();
+        }
+        if (mStillDecoder != null) {
+            mStillDecoder.release();
+            mStillDecoder = null;
         }
     }
 
@@ -484,6 +489,50 @@ public class FlutterQuickVideoEncoderPlugin implements
                                 frame.put("rgba", image.rgba);
                                 frame.put("width", image.width);
                                 frame.put("height", image.height);
+                                result.success(frame);
+                            }));
+                    break;
+                }
+                case "stillAt":
+                {
+                    // **A photograph decoded here rather than by the framework,
+                    // because the framework's Android path cannot be told how
+                    // big to decode and cannot fail without ending the
+                    // process.** See StillDecoder for the two mechanisms; the
+                    // short version is that a 200 MP HEIF is an 800 MB
+                    // allocation for a 40-point thumbnail, and an
+                    // OutOfMemoryError inside it reaches JNI as a pending
+                    // exception and aborts.
+                    String stillPath = call.argument("path");
+                    Number stillEdge = call.argument("maxEdge");
+                    if (stillPath == null || stillEdge == null) {
+                        result.error("stillAt",
+                                "path and maxEdge are both required", null);
+                        break;
+                    }
+                    if (mStillDecoder == null) {
+                        mStillDecoder = new StillDecoder();
+                    }
+                    // Same hop as clipFrameAt, for the same reason: the decode
+                    // is off the platform thread and `result` is not
+                    // thread-safe.
+                    mStillDecoder.decode(stillPath, stillEdge.intValue(),
+                            still -> mMainHandler.post(() -> {
+                                if (still == null) {
+                                    result.success(null);
+                                    return;
+                                }
+                                Map<String, Object> frame = new java.util.LinkedHashMap<>();
+                                frame.put("rgba", still.rgba);
+                                frame.put("width", still.width);
+                                frame.put("height", still.height);
+                                // **A field rather than an assumption.** Only
+                                // rgba8888 is produced today; naming it is what
+                                // lets a wider format arrive later without
+                                // every call site having assumed this one.
+                                frame.put("format", "rgba8888");
+                                frame.put("colorSpace", "srgb");
+                                frame.put("hasGainmap", still.hasGainmap);
                                 result.success(frame);
                             }));
                     break;
