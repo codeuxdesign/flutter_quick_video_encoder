@@ -171,6 +171,21 @@ public class FlutterQuickVideoEncoderPlugin implements
             mThermal.close();
             mThermal = null;
         }
+        // **Here rather than in releaseClipPreviews, which is where these
+        // started.** Neither of these has anything to do with clip previews:
+        // that method is called every time the Clips screen stops being shown
+        // and at the start of every export, so releasing the still decoder
+        // there tore down a thread the shot list was about to use again — and
+        // detach, the one moment they genuinely must go, released neither, so
+        // an activity recreate stranded a thread of each per cycle.
+        if (mStillDecoder != null) {
+            mStillDecoder.release();
+            mStillDecoder = null;
+        }
+        if (mClipDurations != null) {
+            mClipDurations.release();
+            mClipDurations = null;
+        }
     }
 
     private void releaseClipCompositor() {
@@ -190,14 +205,6 @@ public class FlutterQuickVideoEncoderPlugin implements
     private void releaseClipPreviews() {
         if (mClipPreviews != null) {
             mClipPreviews.release();
-        }
-        if (mStillDecoder != null) {
-            mStillDecoder.release();
-            mStillDecoder = null;
-        }
-        if (mClipDurations != null) {
-            mClipDurations.release();
-            mClipDurations = null;
         }
     }
 

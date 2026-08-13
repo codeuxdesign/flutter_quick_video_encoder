@@ -64,11 +64,28 @@ public class ClipDuration {
     }
 
     public void secondsOf(final String path, final Delivery delivery) {
-        mWorker.execute(() -> delivery.onDuration(read(path)));
+        try {
+            mWorker.execute(() -> delivery.onDuration(read(path)));
+        } catch (java.util.concurrent.RejectedExecutionException rejected) {
+            // A refused task still has to answer — see StillDecoder.decode. The
+            // caller is an import waiting on a MethodChannel result with no
+            // timeout, so a dropped task hangs the whole import rather than
+            // costing one clip its length.
+            Log.w(TAG, "clip timing refused, shutting down: " + path);
+            delivery.onDuration(null);
+        }
     }
 
+    /**
+     * Stops taking new work and lets what is queued answer.
+     *
+     * <p>{@code shutdown()} rather than {@code shutdownNow()}: a discarded task
+     * never calls its delivery, so the {@code MethodChannel} result is never
+     * sent and the Dart future never completes. An import waiting on one would
+     * simply stop, with no error to show for it.
+     */
     public void release() {
-        mWorker.shutdownNow();
+        mWorker.shutdown();
     }
 
     /**

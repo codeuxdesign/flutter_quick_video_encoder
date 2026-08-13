@@ -109,25 +109,54 @@ public class StillDecoder {
      * size, because a thumbnail slot is a ceiling rather than a target.
      */
     public void decode(final String path, final int maxEdge, final Delivery delivery) {
-        mWorker.execute(() -> {
-            Still still = null;
-            try {
-                still = decodeBounded(new File(path), Math.max(1, maxEdge));
-            } catch (Throwable error) {
-                // **`Throwable`, not `Exception`, and that is the whole fix.**
-                // The failures that end this process are an `OutOfMemoryError`
-                // and a `NullPointerException` from inside the platform's own
-                // decoder — one of which is not an `Exception` at all. Catching
-                // the narrower type here would rewrite the code and keep the
-                // crash.
-                Log.w(TAG, "still decode failed: " + path, error);
-            }
-            delivery.onStill(still);
-        });
+        try {
+            mWorker.execute(() -> deliverDecode(path, maxEdge, delivery));
+        } catch (java.util.concurrent.RejectedExecutionException rejected) {
+            // **A refused task still has to answer.** The queue rejects once the
+            // executor is shutting down, and a caller waiting on a MethodChannel
+            // result has no timeout — a decode that is simply dropped leaves the
+            // Dart future pending forever, which on screen is a thumbnail stuck
+            // on its placeholder and indistinguishable from a rider who took no
+            // photographs. Null is the honest answer and one the caller already
+            // handles.
+            Log.w(TAG, "still decode refused, shutting down: " + path);
+            delivery.onStill(null);
+        }
     }
 
+    private static void deliverDecode(String path, int maxEdge, Delivery delivery) {
+        Still still = null;
+        try {
+            still = decodeBounded(new File(path), Math.max(1, maxEdge));
+        } catch (Throwable error) {
+            // **`Throwable`, not `Exception`, and that is the whole fix.**
+            // The failures that end this process are an `OutOfMemoryError`
+            // and a `NullPointerException` from inside the platform's own
+            // decoder — one of which is not an `Exception` at all. Catching
+            // the narrower type here would rewrite the code and keep the
+            // crash.
+            Log.w(TAG, "still decode failed: " + path, error);
+        }
+        delivery.onStill(still);
+    }
+
+    /**
+     * Stops taking new work and lets what is queued answer.
+     *
+     * <p><b>{@code shutdown()}, never {@code shutdownNow()}.</b> The difference
+     * is not tidiness: {@code shutdownNow} discards queued tasks, and a
+     * discarded decode never calls its delivery, so the {@code MethodChannel}
+     * result is never sent and the Dart future <i>never completes</i> — not
+     * null, not an error, nothing. This is called whenever the Clips screen
+     * stops being shown and at the start of every export, so a rider stepping
+     * from Clips to the shot list could strand seventeen of eighteen
+     * thumbnails on their placeholder, permanently and silently.
+     *
+     * <p>The queued decodes are short and bounded, so draining them costs a
+     * moment of a worker thread nobody is waiting on.
+     */
     public void release() {
-        mWorker.shutdownNow();
+        mWorker.shutdown();
     }
 
     private static Still decodeBounded(File file, int maxEdge) throws IOException {
