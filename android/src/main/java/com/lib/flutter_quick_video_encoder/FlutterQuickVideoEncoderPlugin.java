@@ -96,6 +96,7 @@ public class FlutterQuickVideoEncoderPlugin implements
      */
     private ClipPreviewCache mClipPreviews;
     private StillDecoder mStillDecoder;
+    private ClipDuration mClipDurations;
 
     /**
      * Says when the phone starts throttling, so a slower render has a reason
@@ -193,6 +194,10 @@ public class FlutterQuickVideoEncoderPlugin implements
         if (mStillDecoder != null) {
             mStillDecoder.release();
             mStillDecoder = null;
+        }
+        if (mClipDurations != null) {
+            mClipDurations.release();
+            mClipDurations = null;
         }
     }
 
@@ -491,6 +496,31 @@ public class FlutterQuickVideoEncoderPlugin implements
                                 frame.put("height", image.height);
                                 result.success(frame);
                             }));
+                    break;
+                }
+                case "clipDuration":
+                {
+                    // **Asked only when the container would not say.** A
+                    // fragmented MP4 states its length as zero in `mvhd` — that
+                    // is what the format specifies, not damage — and may omit
+                    // the `mehd` that would have carried the real one. The
+                    // reader in Dart handles every case it can from the header
+                    // alone, precisely so this call stays rare.
+                    //
+                    // The extractor is the authority rather than a second
+                    // opinion: it is what the export will seek inside, so its
+                    // answer is the one a trim handle must be bounded by. See
+                    // ClipDuration.
+                    String durationPath = call.argument("path");
+                    if (durationPath == null) {
+                        result.error("clipDuration", "path is required", null);
+                        break;
+                    }
+                    if (mClipDurations == null) {
+                        mClipDurations = new ClipDuration();
+                    }
+                    mClipDurations.secondsOf(durationPath,
+                            seconds -> mMainHandler.post(() -> result.success(seconds)));
                     break;
                 }
                 case "stillAt":

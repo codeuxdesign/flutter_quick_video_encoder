@@ -286,6 +286,40 @@ class FlutterQuickVideoEncoder {
     };
   }
 
+  /// How long the clip at [path] runs, according to the reader that will
+  /// decode it. Null when this device cannot tell.
+  ///
+  /// **Ask the container first; this is the fallback.** An MP4 states its own
+  /// length in `moov/mvhd`, and reading it there costs a few hundred bytes and
+  /// no platform call. Two shapes defeat that and neither is damage: a
+  /// *fragmented* MP4 is specified to write `mvhd.duration` as zero — its
+  /// samples are not in the `moov` to be totalled — and may omit the
+  /// `mvex/mehd` that carries the intended length, after which nothing short of
+  /// walking every fragment in the file knows the answer. That walk is what the
+  /// platform has already implemented.
+  ///
+  /// **The authority argument matters more than the availability one.** This
+  /// answers from `MediaExtractor` on Android and the video track's own time
+  /// range on Apple — which is to say, from the object the export will later
+  /// seek inside. A trim handle bounded by any *other* number can be dragged to
+  /// a moment the export cannot reach, and the film then comes back shorter
+  /// than the rider asked for with nothing reporting why.
+  ///
+  /// Video tracks only. An audio track routinely runs a frame or two past the
+  /// picture, and a film is only as long as its pictures.
+  ///
+  /// Both platforms answer, off the platform thread. A file this cannot time is
+  /// in practice a file this device cannot decode — which
+  /// [checkClipsDecodable] already reports by name, so nothing is invented
+  /// here to paper over it.
+  static Future<double?> clipDuration(String path) async {
+    final seconds = await _invokeMethod<double>('clipDuration', {'path': path});
+    if (seconds == null || !seconds.isFinite || seconds <= 0) {
+      return null;
+    }
+    return seconds;
+  }
+
   /// The frame [path] shows at [at], as pixels a widget can draw.
   ///
   /// Null when the clip cannot be opened or decoded — the same conditions

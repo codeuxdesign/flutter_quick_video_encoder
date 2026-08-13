@@ -825,6 +825,48 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             }
             result(failures);
         }
+        else if ([@"clipDuration" isEqualToString:call.method])
+        {
+            // **Asked only when the container would not say.** A fragmented MP4
+            // states its length as zero in `mvhd` — the format specifies that,
+            // it is not damage — and is permitted to omit the `mehd` that would
+            // carry the real one. The Dart reader handles every case it can from
+            // the header alone, so this stays the rare path.
+            //
+            // Answered off the platform thread: `AVURLAsset` parses on first
+            // ask, and on a large fragmented file that is not a few
+            // microseconds. Video tracks only — an audio track routinely outruns
+            // the picture, and a film is only as long as its pictures, so the
+            // wrong maximum here would let a trim handle reach past the last
+            // frame.
+            NSDictionary *args = (NSDictionary *)call.arguments;
+            NSString *path = args[@"path"];
+            if (![path isKindOfClass:[NSString class]]) {
+                result([FlutterError errorWithCode:@"clipDuration"
+                                           message:@"path is required"
+                                           details:nil]);
+                return;
+            }
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                NSNumber *seconds = nil;
+                AVURLAsset *asset =
+                    [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+                AVAssetTrack *video = FQVEFirstTrack(asset, AVMediaTypeVideo);
+                CMTime length = video ? video.timeRange.duration : kCMTimeInvalid;
+                if (CMTIME_IS_NUMERIC(length)) {
+                    Float64 value = CMTimeGetSeconds(length);
+                    if (isfinite(value) && value > 0) {
+                        seconds = @(value);
+                    }
+                }
+                if (!seconds) {
+                    NSLog(@"FQVE: CLIP could not time %@", path);
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    result(seconds);
+                });
+            });
+        }
         else if ([@"clipFrameAt" isEqualToString:call.method])
         {
             // One decode per scrub position, through the reader the export uses.
