@@ -97,6 +97,7 @@ public class FlutterQuickVideoEncoderPlugin implements
     private ClipPreviewCache mClipPreviews;
     private StillDecoder mStillDecoder;
     private ClipDuration mClipDurations;
+    private ClipCheck mClipChecks;
 
     /**
      * Says when the phone starts throttling, so a slower render has a reason
@@ -181,6 +182,10 @@ public class FlutterQuickVideoEncoderPlugin implements
         if (mStillDecoder != null) {
             mStillDecoder.release();
             mStillDecoder = null;
+        }
+        if (mClipChecks != null) {
+            mClipChecks.release();
+            mClipChecks = null;
         }
         if (mClipDurations != null) {
             mClipDurations.release();
@@ -463,11 +468,33 @@ public class FlutterQuickVideoEncoderPlugin implements
                     // clip opened and produced a frame. Named paths rather than
                     // a count, because the message a rider needs is which of
                     // *their* files this device cannot read.
+                    //
+                    // **Off the platform thread**, because the work is a codec
+                    // configure and a decoded frame per clip and it runs over
+                    // the whole import — six clips is already past the ANR
+                    // window. See ClipCheck; it froze the import screen on the
+                    // exact device the check was protecting.
                     List<?> paths = call.argument("paths");
-                    Map<String, String> failures = paths == null
-                            ? new java.util.LinkedHashMap<String, String>()
-                            : ClipCompositor.undecodable(paths);
-                    result.success(failures);
+                    if (paths == null) {
+                        result.success(new java.util.LinkedHashMap<String, String>());
+                        break;
+                    }
+                    if (mClipChecks == null) {
+                        mClipChecks = new ClipCheck();
+                    }
+                    mClipChecks.check(paths, failures -> mMainHandler.post(() -> {
+                        if (failures == null) {
+                            // **Not an empty map.** Empty means every clip
+                            // decoded, which is what lets the render start.
+                            // Saying that when the check never ran is how a
+                            // rider learns about an unreadable clip four
+                            // thousand frames in.
+                            result.error("checkClipsDecodable",
+                                    "the clip check could not be run", null);
+                            return;
+                        }
+                        result.success(failures);
+                    }));
                     break;
                 }
                 case "clipFrameAt":
