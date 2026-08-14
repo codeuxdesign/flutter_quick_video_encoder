@@ -1,4 +1,7 @@
 
+// SPM has no prefix header, so TARGET_OS_OSX must be imported rather than inherited.
+#import <TargetConditionals.h>
+
 #if TARGET_OS_OSX
 #import <FlutterMacOS/FlutterMacOS.h>
 #else

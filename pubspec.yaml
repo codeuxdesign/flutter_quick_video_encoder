@@ -19,6 +19,8 @@ flutter:
         pluginClass: FlutterQuickVideoEncoderPlugin
       ios:
         pluginClass: FlutterQuickVideoEncoderPlugin
+        sharedDarwinSource: true
       macos:
         pluginClass: FlutterQuickVideoEncoderPlugin
+        sharedDarwinSource: true
 
