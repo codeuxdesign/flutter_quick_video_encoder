@@ -849,30 +849,43 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             // platform makes "every clip is fine" and "nobody asked" the same
             // answer everywhere else — which is the shape of failure this call
             // was added to remove.
+            //
+            // **Answered off the platform thread, like `clipDuration` below.**
+            // This opens a decode session per clip and pulls a frame through it,
+            // which is a couple of hundred milliseconds each — and the platform
+            // thread is the thread Dart runs on, so doing it here froze the app
+            // for the length of the rider's clip list on the way to the Export
+            // step. Android has always hopped this to a worker; only Apple ran it
+            // inline.
             NSDictionary *args = (NSDictionary *)call.arguments;
             NSArray *paths = args[@"paths"];
-            NSMutableDictionary<NSString *, NSString *> *failures =
-                [NSMutableDictionary dictionary];
-            for (id item in (paths ?: @[])) {
-                if (![item isKindOfClass:[NSString class]]) { continue; }
-                NSString *path = (NSString *)item;
-                NSString *reason = nil;
-                FQVEClipReader *probe = [[FQVEClipReader alloc] initWithPath:path
-                                                                      reason:&reason];
-                if (!probe) {
-                    failures[path] = reason ?: @"could not be opened";
-                } else if (![probe frameAtTime:kCMTimeZero]) {
-                    // Opening is not reading. A file whose header parses and
-                    // whose first sample does not decode is exactly the case
-                    // that would otherwise reach the compositor and encode as a
-                    // black window with nothing logged.
-                    failures[path] = @"opened but decoded no frame";
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                NSMutableDictionary<NSString *, NSString *> *failures =
+                    [NSMutableDictionary dictionary];
+                for (id item in (paths ?: @[])) {
+                    if (![item isKindOfClass:[NSString class]]) { continue; }
+                    NSString *path = (NSString *)item;
+                    NSString *reason = nil;
+                    FQVEClipReader *probe = [[FQVEClipReader alloc] initWithPath:path
+                                                                          reason:&reason];
+                    if (!probe) {
+                        failures[path] = reason ?: @"could not be opened";
+                    } else if (![probe frameAtTime:kCMTimeZero]) {
+                        // Opening is not reading. A file whose header parses and
+                        // whose first sample does not decode is exactly the case
+                        // that would otherwise reach the compositor and encode as
+                        // a black window with nothing logged.
+                        failures[path] = @"opened but decoded no frame";
+                    }
+                    if (failures[path]) {
+                        NSLog(@"FQVE: CLIP cannot decode %@: %@", path, failures[path]);
+                    }
                 }
-                if (failures[path]) {
-                    NSLog(@"FQVE: CLIP cannot decode %@: %@", path, failures[path]);
-                }
-            }
-            result(failures);
+                // A `FlutterResult` belongs to the platform thread.
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    result(failures);
+                });
+            });
         }
         else if ([@"clipDuration" isEqualToString:call.method])
         {
