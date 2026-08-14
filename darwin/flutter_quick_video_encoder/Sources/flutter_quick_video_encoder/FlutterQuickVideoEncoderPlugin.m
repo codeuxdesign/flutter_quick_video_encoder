@@ -7,9 +7,13 @@
 #import <AVFoundation/AVAssetWriterInput.h>
 #import <AVFoundation/AVMediaFormat.h>
 
-#import <CoreMedia/CoreMedia.h> 
+#import <CoreMedia/CoreMedia.h>
 #import <CoreMedia/CMFormatDescription.h>
 #import <CoreMedia/CMSampleBuffer.h>
+
+// For the preview queue's generation counter, which is written from the platform
+// thread and read on the queue.
+#import <stdatomic.h>
 
 #define kOutputBus 0
 #define NAMESPACE @"flutter_quick_video_encoder" 
@@ -515,11 +519,25 @@ static NSData *FQVEClipPreviewRgba(CVPixelBufferRef clip,
          completion:(void (^)(NSData *rgba, int width, int height))completion;
 /// Closes every reader, and does not return until they are closed.
 - (void)releaseReaders;
+/// Closes every reader without holding up the thread that asked.
+- (void)releaseReadersAsync:(void (^)(void))done;
 @end
 
 @implementation FQVEClipPreviews {
     dispatch_queue_t _queue;
     NSMutableDictionary<NSString *, FQVEClipPreviewEntry *> *_readers;
+    /// Which round of previews is current.
+    ///
+    /// **This is what makes letting go cheap.** The queue is serial and a screen
+    /// of handles enqueues one decode each, so a release that simply took its
+    /// turn waited out the whole backlog — a second or more of 4K seeks producing
+    /// frames nobody will look at, with the caller parked behind them. Bumping
+    /// this first lets each queued decode retire at the head of the queue instead
+    /// of running.
+    ///
+    /// Written from the platform thread and read on the preview queue, hence
+    /// atomic.
+    _Atomic(uint64_t) _generation;
 }
 
 /// How many decoders may be open at once.
@@ -552,10 +570,20 @@ static const NSTimeInterval kFQVEPreviewIdleSeconds = 20.0;
             maxEdge:(int)maxEdge
          completion:(void (^)(NSData *, int, int))completion
 {
+    uint64_t round = atomic_load(&_generation);
     dispatch_async(_queue, ^{
         NSData *rgba = nil;
         int width = 0;
         int height = 0;
+
+        // Queued for a screen that has since gone away. Answered rather than
+        // dropped, because the call still has a `result` waiting on it, and nil
+        // is the answer the caller already handles — the same one a clip with no
+        // picture gives.
+        if (atomic_load(&self->_generation) != round) {
+            completion(nil, 0, 0);
+            return;
+        }
 
         FQVEClipReader *reader = [self readerFor:path];
         if (reader) {
@@ -577,11 +605,32 @@ static const NSTimeInterval kFQVEPreviewIdleSeconds = 20.0;
 }
 
 - (void)releaseReaders {
-    // Blocking is the point. The two callers are the screen going away and an
-    // export setting up, and an export that begins while a decode session is
-    // still being handed back is the failure this exists to prevent.
+    // Blocking is the point **for the export**, which is now the only caller: an
+    // export that begins while a decode session is still being handed back is the
+    // failure this exists to prevent. The screen going away has the opposite
+    // requirement and uses `releaseReadersAsync:`.
+    //
+    // Cancelling first is what bounds the wait by the one decode already running
+    // rather than by the whole backlog behind it.
+    atomic_fetch_add(&_generation, 1);
     dispatch_sync(_queue, ^{
         [self->_readers removeAllObjects];
+    });
+}
+
+- (void)releaseReadersAsync:(void (^)(void))done {
+    // **The screen going away must not block the thread it was drawn on.**
+    // Nothing races the departure — the previews are already out of the widget
+    // tree — so there is nothing here for a barrier to protect, and this side had
+    // no timeout to fall back on either: `dispatch_sync` behind a backlog of 4K
+    // seeks parks the platform thread for as long as they take.
+    //
+    // [done] runs on the preview queue; the caller hops back to whatever thread
+    // it needs to answer on.
+    atomic_fetch_add(&_generation, 1);
+    dispatch_async(_queue, ^{
+        [self->_readers removeAllObjects];
+        done();
     });
 }
 
@@ -908,8 +957,24 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
         }
         else if ([@"releaseClipPreviews" isEqualToString:call.method])
         {
-            [self.mClipPreviews releaseReaders];
-            result(nil);
+            // **Answered from the preview queue rather than by parking the
+            // platform thread on it.** This arrives every time the Clips screen
+            // stops being shown, which is routinely *while* its thumbnails are
+            // still decoding — and the queue is serial, so waiting here waited out
+            // the whole backlog. On a platform where the platform thread is also
+            // the thread Dart runs on, that wait stops frames outright.
+            //
+            // Same hop as clipFrameAt, for the same reason: a `FlutterResult`
+            // belongs to the platform thread.
+            if (!self.mClipPreviews) {
+                result(nil);
+                return;
+            }
+            [self.mClipPreviews releaseReadersAsync:^{
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    result(nil);
+                });
+            }];
         }
         else if ([@"setLogLevel" isEqualToString:call.method])
         {

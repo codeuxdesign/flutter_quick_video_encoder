@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Decoders held open so a trim handle can be dragged.
@@ -76,6 +77,25 @@ final class ClipPreviewCache {
 
     private final LinkedHashMap<String, Entry> readers = new LinkedHashMap<>();
 
+    /**
+     * Which round of previews is current.
+     *
+     * <p><b>This is what makes letting go cheap.</b> The worker is serial and a
+     * screen of handles queues one decode each, so a release that simply took its
+     * turn waited out the whole backlog — a second or more of 4K seeks producing
+     * frames that nobody will ever look at, with the caller parked behind them.
+     * Bumping this first lets each queued decode retire at the head of the worker
+     * instead of running, so the wait shrinks to the one decode already in
+     * progress.
+     *
+     * <p>The frames really are unwanted: the previews leave the widget tree the
+     * moment the step stops being shown, and a rider who steps back queues fresh
+     * work under the new round. Nothing is lost by dropping the old.
+     *
+     * <p>Written from the platform thread and read on the worker, hence atomic.
+     */
+    private final AtomicLong generation = new AtomicLong();
+
     private static final class Entry {
         final ClipReader reader;
         long lastUsedMillis;
@@ -95,7 +115,16 @@ final class ClipPreviewCache {
      * be previewed, not to fail.
      */
     void frameAt(String path, long timeUs, int maxEdge, Delivery delivery) {
+        final long round = generation.get();
         worker.execute(() -> {
+            // Queued for a screen that has since gone away. Answered rather than
+            // dropped, because the call still has a `result` waiting on it, and
+            // null is the answer the caller already handles — the same one a clip
+            // with no picture gives.
+            if (generation.get() != round) {
+                delivery.onImage(null);
+                return;
+            }
             ClipPreview.Image image = null;
             try {
                 image = ClipPreview.from(readerFor(path).frameAtTime(timeUs), maxEdge);
@@ -116,12 +145,24 @@ final class ClipPreviewCache {
     /**
      * Closes every reader, and does not return until they are closed.
      *
-     * <p>Blocking is the point. The two callers are the screen going away and an
-     * export starting, and an export that begins while a decoder is still being
-     * handed back is the failure this is here to prevent — one that would surface
-     * on a phone, once, as an unrelated clip refusing to open.
+     * <p>Blocking is the point <b>for the export</b>, which is now the only
+     * caller: an export that begins while a decoder is still being handed back is
+     * the failure this is here to prevent — one that surfaces on a phone, once,
+     * as an unrelated clip refusing to open. The screen going away has the
+     * opposite requirement and uses {@link #releaseAsync}.
+     *
+     * <p>Even here the wait is now bounded by one decode rather than by the
+     * backlog, because cancelling comes first. It used to be neither: the screen
+     * called this on every step change, so leaving the Clips screen mid-load
+     * parked the platform thread — which under merged platform/UI threading is
+     * the thread Dart runs on — until every queued thumbnail had been decoded and
+     * thrown away. The symptom was that the step indicator stopped animating for
+     * exactly as long as the thumbnails had left to load.
      */
     void release() {
+        // Cancel first, so closing does not queue behind decodes whose frames are
+        // already unwanted.
+        generation.incrementAndGet();
         try {
             worker.submit(this::closeAll).get(10, TimeUnit.SECONDS);
         } catch (Exception e) {
@@ -130,6 +171,25 @@ final class ClipPreviewCache {
             // so is better than either hanging or pretending it worked.
             Log.w(TAG, "CLIP preview release did not complete: " + e);
         }
+    }
+
+    /**
+     * Closes every reader without holding up the thread that asked.
+     *
+     * <p><b>The screen going away must not block the thread it was drawn on.</b>
+     * Nothing races the departure — the previews are already out of the widget
+     * tree — so there is nothing here for a barrier to protect, and the export
+     * that does need one takes it itself in {@link #release}.
+     *
+     * <p>[done] runs on the worker once the readers are closed; the caller is
+     * responsible for hopping back to whatever thread it needs to answer on.
+     */
+    void releaseAsync(Runnable done) {
+        generation.incrementAndGet();
+        worker.execute(() -> {
+            closeAll();
+            done.run();
+        });
     }
 
     /** Lets the worker thread go, for good. */

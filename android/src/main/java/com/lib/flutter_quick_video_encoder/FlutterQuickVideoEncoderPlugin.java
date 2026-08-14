@@ -603,8 +603,27 @@ public class FlutterQuickVideoEncoderPlugin implements
                 }
                 case "releaseClipPreviews":
                 {
-                    releaseClipPreviews();
-                    result.success(null);
+                    // **Answered from the worker rather than by parking the
+                    // platform thread on it.** This arrives every time the Clips
+                    // screen stops being shown, which is routinely *while* its
+                    // thumbnails are still decoding — and the worker is serial,
+                    // so waiting here waited out the whole backlog. Under merged
+                    // platform/UI threading the platform thread is the thread
+                    // Dart runs on, so that wait stopped frames outright: the
+                    // step indicator sat still for exactly as long as the
+                    // thumbnails had left to load, while the already-submitted
+                    // frame kept the next step on screen and made it look as
+                    // though nothing was wrong.
+                    //
+                    // Same hop as clipFrameAt and stillAt, for the same reason:
+                    // the work is off the platform thread and `result` is not
+                    // thread-safe.
+                    if (mClipPreviews == null) {
+                        result.success(null);
+                        break;
+                    }
+                    mClipPreviews.releaseAsync(
+                            () -> mMainHandler.post(() -> result.success(null)));
                     break;
                 }
                 case "finish":
