@@ -1088,12 +1088,46 @@ public class FlutterQuickVideoEncoderPlugin implements
 
     private void fillImage(Image image, byte[] yuv420, int width, int height) {
         Image.Plane[] planes = image.getPlanes();
+        logEncoderLayoutOnce(planes);
         FrameYuv.fillPlanes(
                 yuv420, width, height,
                 planes[0].getBuffer(), planes[0].getRowStride(), planes[0].getPixelStride(),
                 planes[1].getBuffer(), planes[1].getRowStride(), planes[1].getPixelStride(),
                 planes[2].getBuffer(), planes[2].getRowStride(), planes[2].getPixelStride());
     }
+
+    /**
+     * The layout this encoder actually asked for, printed once per session.
+     *
+     * <p><b>`ClipReader` has logged this for the decoder since it was written
+     * and nothing logged it for the encoder, which is how a fix that covered
+     * one plane of three passed for finished.</b>
+     * `COLOR_FormatYUV420Flexible` is a family: this device answers
+     * {@code y(px=1) u(px=2) v(px=2)} — semiplanar — while a planar one answers
+     * 1 across the board, and `FrameYuv.writePlane` takes a completely
+     * different path for each. Both are correct and one used to be eight times
+     * slower, so the difference was invisible in everything except a stopwatch
+     * nobody was holding.
+     *
+     * <p>Once, not per frame: the answer cannot change inside a session, and
+     * 4,339 copies of it would bury the line that matters.
+     */
+    private void logEncoderLayoutOnce(Image.Plane[] planes) {
+        if (mLoggedEncoderLayout) {
+            return;
+        }
+        mLoggedEncoderLayout = true;
+        Log.i(TAG, "FEED layout"
+                + " y(row=" + planes[0].getRowStride()
+                + ",px=" + planes[0].getPixelStride() + ")"
+                + " u(row=" + planes[1].getRowStride()
+                + ",px=" + planes[1].getPixelStride() + ")"
+                + " v(row=" + planes[2].getRowStride()
+                + ",px=" + planes[2].getPixelStride() + ")"
+                + (planes[1].getPixelStride() == 1 ? " planar" : " semiplanar"));
+    }
+
+    private boolean mLoggedEncoderLayout = false;
 
     private int getColorFormat() {
         return MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible;
