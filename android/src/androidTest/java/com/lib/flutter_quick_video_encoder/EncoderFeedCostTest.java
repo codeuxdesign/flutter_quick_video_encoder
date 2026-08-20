@@ -189,6 +189,160 @@ public class EncoderFeedCostTest {
         }
     }
 
+    /**
+     * Is the fill slow because it is a copy, or because of where it copies to?
+     *
+     * <p><b>The two answers have completely different fixes and the row cannot
+     * tell them apart.</b> `fill_bulk=21.8ms` moves 3,110,400 bytes, which is
+     * about 142 MB/s — ten to fifty times slower than a `memcpy` of that size
+     * has any business being. Neither per-call overhead (2,160 bulk puts of
+     * ~1.4 KB) nor throttling (1.8 GHz against 3.3 turns 3 ms into 5.5, not
+     * 21.8) covers that. The suspicion is that a hardware codec's input planes
+     * are uncached or write-combined ION memory, where byte-oriented writes run
+     * at roughly this rate — and if that is true, **no cleverer copy touches
+     * it**: not NDK, not SIMD, not fusing the convert into the fill. Only not
+     * writing there, which means `createInputSurface` and a rewrite of this
+     * path. If instead the two come out close, the copy is ordinary and a
+     * native pass is worth half the win at a fraction of the risk.
+     *
+     * <p><b>The control is `allocateDirect`.</b> Same `fillPlanes`, same
+     * strides, same sizes, same loop — a direct `ByteBuffer` either way, so the
+     * Java path is identical and the only thing that differs is what the memory
+     * is. Allocated once outside the loop, so neither allocation nor first-touch
+     * faulting lands in the timer.
+     *
+     * <p><b>The order alternates.</b> Whichever fill runs second reads a source
+     * array that the first one just walked, so a fixed order would hand it a
+     * warm cache and quietly favor it. Even iterations go codec-first, odd ones
+     * heap-first, and each accumulates separately.
+     *
+     * <p>No threshold is asserted, deliberately: the output of this is the
+     * ratio, and inventing a bar before anybody has seen one would be a number
+     * with nothing behind it. What is asserted is that it ran and that the bytes
+     * really landed, so a green run cannot mean an elided loop.
+     */
+    @Test
+    public void whetherTheFillCostIsTheDestination() throws Exception {
+        final byte[] rgba = aFrame();
+        final MediaCodec encoder = startEncoder();
+        ByteBuffer heapY = null;
+        ByteBuffer heapU = null;
+        ByteBuffer heapV = null;
+        try {
+            byte[] scratch = FrameYuv.toYuv420Planar(rgba, WIDTH, HEIGHT, null);
+            long codecNanos = 0;
+            long heapNanos = 0;
+            int measured = 0;
+
+            for (int i = 0; i < WARMUP + MEASURED; i++) {
+                final int index = encoder.dequeueInputBuffer(1_000_000L);
+                if (index < 0) {
+                    continue;
+                }
+                final Image image = encoder.getInputImage(index);
+                if (image == null) {
+                    encoder.queueInputBuffer(index, 0, 0, 0, 0);
+                    continue;
+                }
+                final Image.Plane[] planes = image.getPlanes();
+                final int yRow = planes[0].getRowStride();
+                final int yPx = planes[0].getPixelStride();
+                final int uRow = planes[1].getRowStride();
+                final int uPx = planes[1].getPixelStride();
+                final int vRow = planes[2].getRowStride();
+                final int vPx = planes[2].getPixelStride();
+
+                if (heapY == null) {
+                    // **Effective, not assumed.** `COLOR_FormatYUV420Flexible`
+                    // is a family, and which member this encoder picked decides
+                    // whether `fillPlanes` takes its bulk path at all — a
+                    // chroma pixel stride of 2 is semiplanar NV12 and sends the
+                    // chroma planes down the per-sample loop the bulk fix was
+                    // supposed to have retired. `ClipReader` logs this for the
+                    // decoder and nothing logged it for the encoder.
+                    Log.i(TAG, String.format(
+                            "FILLLAYOUT y(row=%d,px=%d) u(row=%d,px=%d) v(row=%d,px=%d)",
+                            yRow, yPx, uRow, uPx, vRow, vPx));
+                    // Matched to the codec's own capacities so the two fills
+                    // write the same number of bytes to the same offsets.
+                    heapY = ByteBuffer.allocateDirect(planes[0].getBuffer().capacity());
+                    heapU = ByteBuffer.allocateDirect(planes[1].getBuffer().capacity());
+                    heapV = ByteBuffer.allocateDirect(planes[2].getBuffer().capacity());
+                    // Touched once, outside the timer, so page faults are not
+                    // charged to the first measured iteration.
+                    fillHeap(scratch, heapY, yRow, yPx, heapU, uRow, uPx, heapV, vRow, vPx);
+                }
+
+                long codec;
+                long heap;
+                if ((i & 1) == 0) {
+                    long started = System.nanoTime();
+                    FrameYuv.fillPlanes(scratch, WIDTH, HEIGHT,
+                            planes[0].getBuffer(), yRow, yPx,
+                            planes[1].getBuffer(), uRow, uPx,
+                            planes[2].getBuffer(), vRow, vPx);
+                    codec = System.nanoTime() - started;
+                    started = System.nanoTime();
+                    fillHeap(scratch, heapY, yRow, yPx, heapU, uRow, uPx, heapV, vRow, vPx);
+                    heap = System.nanoTime() - started;
+                } else {
+                    long started = System.nanoTime();
+                    fillHeap(scratch, heapY, yRow, yPx, heapU, uRow, uPx, heapV, vRow, vPx);
+                    heap = System.nanoTime() - started;
+                    started = System.nanoTime();
+                    FrameYuv.fillPlanes(scratch, WIDTH, HEIGHT,
+                            planes[0].getBuffer(), yRow, yPx,
+                            planes[1].getBuffer(), uRow, uPx,
+                            planes[2].getBuffer(), vRow, vPx);
+                    codec = System.nanoTime() - started;
+                }
+
+                encoder.queueInputBuffer(index, 0,
+                        encoder.getInputBuffer(index).capacity(),
+                        i * 33_333L, 0);
+
+                if (i >= WARMUP) {
+                    codecNanos += codec;
+                    heapNanos += heap;
+                    measured++;
+                }
+            }
+
+            assertTrue("no input buffers were measured", measured > 0);
+            final double codec = codecNanos / (double) measured / 1e6;
+            final double heap = heapNanos / (double) measured / 1e6;
+            final int bytes = WIDTH * HEIGHT * 3 / 2;
+            Log.i(TAG, String.format(
+                    "FILLDEST %dx%d bytes=%d codec=%.1fms/%.0fMBps"
+                            + " heap=%.1fms/%.0fMBps ratio=%.1fx",
+                    WIDTH, HEIGHT, bytes,
+                    codec, bytes / 1e6 / (codec / 1e3),
+                    heap, bytes / 1e6 / (heap / 1e3),
+                    heap == 0 ? 0 : codec / heap));
+
+            // Not a threshold — a guard that the loop actually wrote something,
+            // so "fast" cannot mean "elided".
+            assertTrue("the heap fill wrote nothing", heapY.get(0) != 0
+                    || heapY.get(1) != 0 || heapY.get(2) != 0);
+        } finally {
+            try {
+                encoder.stop();
+            } catch (Exception ignored) {
+                // Reported by whatever threw first.
+            }
+            encoder.release();
+        }
+    }
+
+    /** [FrameYuv.fillPlanes] against buffers of this test's own. */
+    private static void fillHeap(byte[] scratch,
+                                 ByteBuffer y, int yRow, int yPx,
+                                 ByteBuffer u, int uRow, int uPx,
+                                 ByteBuffer v, int vRow, int vPx) {
+        FrameYuv.fillPlanes(scratch, WIDTH, HEIGHT, y, yRow, yPx,
+                u, uRow, uPx, v, vRow, vPx);
+    }
+
     /** Speed is only worth having if both fills put the same bytes down. */
     @Test
     public void bothFillsAgreeByteForByte() {

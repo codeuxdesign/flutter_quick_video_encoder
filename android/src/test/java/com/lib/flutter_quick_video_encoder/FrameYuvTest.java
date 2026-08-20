@@ -1,5 +1,6 @@
 package com.lib.flutter_quick_video_encoder;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -130,5 +131,113 @@ public class FrameYuvTest {
     public void theOutputIsPlanarAndHalfAgainAsLongAsTheLuma() {
         final byte[] yuv = FrameYuv.toYuv420Planar(new byte[8 * 6 * 4], 8, 6);
         assertEquals(8 * 6 * 3 / 2, yuv.length);
+    }
+
+    /**
+     * Semiplanar chroma: the layout a real phone hands back, and the one the
+     * bulk fill did not cover for a month.
+     *
+     * <p><b>There was no semiplanar case in this file at all</b>, which is why
+     * it survived: every host test wrote a planar layout, took the memcpy
+     * branch, and passed — while a Galaxy S24 Ultra reports
+     * {@code u(px=2) v(px=2)} and sent both chroma planes down the per-sample
+     * loop the branch exists to avoid. On device that loop was the entire
+     * remaining cost of the fill.
+     *
+     * <p><b>The assertion that matters is the one about bytes nobody wrote.</b>
+     * U and V interleave into the same memory, so a bulk write over U's span
+     * would flatten V — and the film would come back with its color wrong in a
+     * way this project has already learned is invisible except against a
+     * reference. The buffer is pre-poisoned, both planes are written, and the
+     * result is compared byte for byte against the per-sample loop that was
+     * always correct.
+     */
+    @Test
+    public void semiplanarChromaMatchesThePerSampleFill() {
+        final int width = 64;
+        final int height = 32;
+        final int chromaWidth = width / 2;
+        final int chromaHeight = height / 2;
+        final int rowStride = 80;
+        final byte[] yuv = new byte[width * height * 3 / 2];
+        for (int i = 0; i < yuv.length; i++) {
+            yuv[i] = (byte) (i * 7 + 13);
+        }
+
+        final byte[] bulk = semiplanarFill(yuv, width, height, rowStride, false, POISON);
+        final byte[] reference =
+                semiplanarFill(yuv, width, height, rowStride, true, POISON);
+
+        assertArrayEquals("the interleaved chroma plane", reference, bulk);
+
+        // **Every chroma byte was written by somebody, proved by poisoning
+        // twice rather than by looking for a sentinel.** Checking `!= POISON`
+        // is what this did first and it is wrong for a reason worth keeping:
+        // the source here is `i * 7 + 13`, which takes the value 0xA5 every 256
+        // samples, so real data reads as untouched memory. Two runs under
+        // different poison agree exactly where a byte was written and differ
+        // everywhere it was not, whatever the data happens to contain.
+        final byte[] other = semiplanarFill(yuv, width, height, rowStride, false, OTHER);
+        final int lumaBytes = rowStride * height;
+        for (int y = 0; y < chromaHeight; y++) {
+            for (int x = 0; x < chromaWidth * 2; x++) {
+                final int at = lumaBytes + y * rowStride + x;
+                assertEquals("chroma byte " + at + " kept its poison, so nothing"
+                        + " wrote it", bulk[at], other[at]);
+            }
+        }
+    }
+
+    private static final byte POISON = (byte) 0xA5;
+    private static final byte OTHER = (byte) 0x5A;
+
+    /**
+     * One NV12-shaped buffer with both chroma planes written into it.
+     *
+     * <p>`perSample` picks the loop: true forces the original scatter by asking
+     * for a layout the bulk path declines, false is what the plugin now runs.
+     * Both are handed identical, poisoned memory.
+     */
+    private static byte[] semiplanarFill(byte[] yuv, int width, int height,
+                                         int rowStride, boolean perSample,
+                                         byte poison) {
+        final int chromaWidth = width / 2;
+        final int chromaHeight = height / 2;
+        final int lumaBytes = rowStride * height;
+        final byte[] backing = new byte[lumaBytes + rowStride * chromaHeight];
+        java.util.Arrays.fill(backing, poison);
+        final java.nio.ByteBuffer y =
+                java.nio.ByteBuffer.wrap(backing, 0, lumaBytes).slice();
+        // U at the plane's first byte, V at its second — NV12, the two of them
+        // sharing every row.
+        final java.nio.ByteBuffer u = java.nio.ByteBuffer
+                .wrap(backing, lumaBytes, rowStride * chromaHeight).slice();
+        final java.nio.ByteBuffer v = java.nio.ByteBuffer
+                .wrap(backing, lumaBytes + 1, rowStride * chromaHeight - 1).slice();
+
+        if (perSample) {
+            final int frameSize = width * height;
+            writePerSample(y, rowStride, 1, yuv, 0, width, height);
+            writePerSample(u, rowStride, 2, yuv, frameSize, chromaWidth, chromaHeight);
+            writePerSample(v, rowStride, 2, yuv,
+                    frameSize + chromaWidth * chromaHeight, chromaWidth, chromaHeight);
+        } else {
+            FrameYuv.fillPlanes(yuv, width, height, y, rowStride, 1,
+                    u, rowStride, 2, v, rowStride, 2);
+        }
+        return backing;
+    }
+
+    /** The fill as it was written, kept here as the thing to match. */
+    private static void writePerSample(java.nio.ByteBuffer dst, int rowStride,
+                                       int pixelStride, byte[] src, int offset,
+                                       int width, int height) {
+        for (int row = 0; row < height; row++) {
+            final int base = row * rowStride;
+            final int from = offset + row * width;
+            for (int col = 0; col < width; col++) {
+                dst.put(base + col * pixelStride, src[from + col]);
+            }
+        }
     }
 }

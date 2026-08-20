@@ -136,12 +136,45 @@ final class FrameYuv {
             }
             return;
         }
-        for (int row = 0; row < height; row++) {
-            final int base = row * rowStride;
-            final int from = offset + row * width;
-            for (int col = 0; col < width; col++) {
-                dst.put(base + col * pixelStride, src[from + col]);
+        // **Semiplanar chroma, which is what a real phone hands back and what
+        // the bulk fix above never covered.** A Galaxy S24 Ultra reports
+        // `y(px=1) u(px=2) v(px=2)` — so luma took the memcpy above and both
+        // chroma planes fell through to a per-sample loop, 518,400
+        // bounds-checked puts each. Measured on device, that loop *was* the
+        // whole remaining cost of the fill: 16.0 ns a put over 1,036,800 chroma
+        // samples is 16.6 ms against 17.1 ms measured, leaving under a
+        // millisecond for luma's 2 MB memcpy. The feed was reported fixed and
+        // was fixed for one plane of three.
+        //
+        // **Not a straight mirror of `ClipReader.copyPlane`, and the asymmetry
+        // is the whole difficulty.** Reading, the bytes between the samples are
+        // simply ignored; writing, they belong to the *other* chroma plane and
+        // a bulk put over the span would clobber them. So each row is read back
+        // first, the new samples are scattered into it in plain array space —
+        // where a store is a store rather than a bounds-checked buffer access —
+        // and the row goes back as one put. Both planes are written, so every
+        // interleaved byte is somebody's, and whichever runs second reads what
+        // the first one left.
+        final int span = (width - 1) * pixelStride + 1;
+        final byte[] row = new byte[span];
+        for (int y = 0; y < height; y++) {
+            final int base = y * rowStride;
+            final int from = offset + y * width;
+            // A final row the buffer does not have room to span — a padded
+            // layout can end early — falls back rather than throwing.
+            if (base + span > dst.limit()) {
+                for (int col = 0; col < width; col++) {
+                    dst.put(base + col * pixelStride, src[from + col]);
+                }
+                continue;
             }
+            dst.position(base);
+            dst.get(row, 0, span);
+            for (int col = 0; col < width; col++) {
+                row[col * pixelStride] = src[from + col];
+            }
+            dst.position(base);
+            dst.put(row, 0, span);
         }
     }
 
