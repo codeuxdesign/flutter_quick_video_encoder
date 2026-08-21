@@ -581,23 +581,23 @@ public class FlutterQuickVideoEncoderPlugin implements
                             seconds -> mMainHandler.post(() -> result.success(seconds)));
                     break;
                 }
-                case "clipFrameRate":
+                case "clipDetails":
                 {
-                    // **What the container claims, not what the frames do.** It
-                    // decides how much footage a strip of a given width should
-                    // span — one dp about one frame — so a variable-rate clip
-                    // being a frame or two out changes nothing visible. See
-                    // ClipDuration.frameRateOf.
-                    String ratePath = call.argument("path");
-                    if (ratePath == null) {
-                        result.error("clipFrameRate", "path is required", null);
+                    // **One probe, every fact.** The frame rate, the codec and
+                    // the color tags all come out of one MediaFormat, so asking
+                    // separately would parse the header once per question and
+                    // let two answers about one file drift apart. See
+                    // ClipDuration.detailsOf.
+                    String detailsPath = call.argument("path");
+                    if (detailsPath == null) {
+                        result.error("clipDetails", "path is required", null);
                         break;
                     }
                     if (mClipDurations == null) {
                         mClipDurations = new ClipDuration();
                     }
-                    mClipDurations.frameRateOf(ratePath,
-                            fps -> mMainHandler.post(() -> result.success(fps)));
+                    mClipDurations.detailsOf(detailsPath,
+                            details -> mMainHandler.post(() -> result.success(details)));
                     break;
                 }
                 case "stillAt":

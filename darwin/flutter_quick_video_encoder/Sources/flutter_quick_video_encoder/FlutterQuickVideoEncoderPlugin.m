@@ -51,6 +51,67 @@ CMSampleBufferRef createAudioSampleBuffer(int fps, int audioFrameIdx, int audioC
 /// deployment target for no benefit here. The wait is bounded: a load that never
 /// completes returns nil rather than hanging the platform thread, because a
 /// wedged export is harder to diagnose than a refused one.
+/// A four-character code as a readable name: 'avc1' to h264, 'hvc1' to hevc.
+static NSString *FQVECodecName(FourCharCode code) {
+    switch (code) {
+        case kCMVideoCodecType_H264: return @"h264";
+        case kCMVideoCodecType_HEVC: return @"hevc";
+        case kCMVideoCodecType_AppleProRes422:
+        case kCMVideoCodecType_AppleProRes422HQ:
+        case kCMVideoCodecType_AppleProRes422LT:
+        case kCMVideoCodecType_AppleProRes422Proxy:
+        case kCMVideoCodecType_AppleProRes4444: return @"prores";
+        case kCMVideoCodecType_JPEG: return @"jpeg";
+        default: {
+            // Unknown is still worth showing — a rider with footage this app
+            // will not take should see *what* it is rather than a blank.
+            char chars[5] = {
+                (char)((code >> 24) & 0xFF), (char)((code >> 16) & 0xFF),
+                (char)((code >> 8) & 0xFF), (char)(code & 0xFF), 0};
+            return [NSString stringWithUTF8String:chars];
+        }
+    }
+}
+
+/// Apple's color tag constants as the same words Android's map produces.
+///
+/// **Both platforms have to name a thing the same way or a panel comparing two
+/// devices reads as a disagreement about the file.** These are the names the
+/// Dart side documents, and they are lowercase and unadorned on purpose.
+static NSString *FQVEPrimariesName(CFStringRef value) {
+    if (!value) { return nil; }
+    if (CFStringCompare(value, kCVImageBufferColorPrimaries_ITU_R_709_2, 0) == kCFCompareEqualTo) {
+        return @"bt709";
+    }
+    if (CFStringCompare(value, kCVImageBufferColorPrimaries_ITU_R_2020, 0) == kCFCompareEqualTo) {
+        return @"bt2020";
+    }
+    if (CFStringCompare(value, kCVImageBufferColorPrimaries_SMPTE_C, 0) == kCFCompareEqualTo ||
+        CFStringCompare(value, kCVImageBufferColorPrimaries_EBU_3213, 0) == kCFCompareEqualTo) {
+        return @"bt601";
+    }
+    return nil;
+}
+
+static NSString *FQVETransferName(CFStringRef value) {
+    if (!value) { return nil; }
+    if (CFStringCompare(value, kCVImageBufferTransferFunction_ITU_R_2100_HLG, 0) == kCFCompareEqualTo) {
+        return @"hlg";
+    }
+    if (CFStringCompare(value, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, 0) == kCFCompareEqualTo) {
+        return @"pq";
+    }
+    if (CFStringCompare(value, kCVImageBufferTransferFunction_Linear, 0) == kCFCompareEqualTo) {
+        return @"linear";
+    }
+    if (CFStringCompare(value, kCVImageBufferTransferFunction_ITU_R_709_2, 0) == kCFCompareEqualTo ||
+        CFStringCompare(value, kCVImageBufferTransferFunction_ITU_R_2020, 0) == kCFCompareEqualTo ||
+        CFStringCompare(value, kCVImageBufferTransferFunction_sRGB, 0) == kCFCompareEqualTo) {
+        return @"sdr";
+    }
+    return nil;
+}
+
 static AVAssetTrack *FQVEFirstTrack(AVURLAsset *asset, AVMediaType type) {
     if (!asset) { return nil; }
     dispatch_semaphore_t loaded = dispatch_semaphore_create(0);
@@ -79,6 +140,140 @@ static AVAssetTrack *FQVEFirstTrack(AVURLAsset *asset, AVMediaType type) {
               asset.URL.lastPathComponent, type);
     }
     return track;
+}
+
+/// Bits per luma sample, read out of the codec configuration atom.
+///
+/// **The only place Apple actually states it.**
+/// `kCMFormatDescriptionExtension_Depth` looks like the answer and is not: it is
+/// QuickTime's legacy *image depth*, 24 for essentially all video whatever the
+/// samples carry, so dividing it by three reported a confident "8-bit" over a 4K
+/// HEVC Main 10 clip. A plausible wrong number is worse than none, because
+/// nothing about it looks like a failure.
+///
+/// So this reads the real field. Both layouts are fixed-offset up to the point
+/// that matters, which is why this is a short function rather than a bitstream
+/// parser:
+///
+/// - **`hvcC`** (ISO/IEC 14496-15 §8.3.3.1) puts `bit_depth_luma_minus8` in the
+///   low three bits of byte 17, after the profile, tier, level, segmentation
+///   and parallelism fields — all of them fixed width.
+/// - **`avcC`** (§5.3.3.1) only carries depth for the profiles that can differ
+///   from eight, and it sits *after* the parameter sets, so the arrays have to
+///   be walked. Every other profile is eight by definition of the profile.
+///
+/// Returns nil rather than guessing when the atom is absent, truncated, or a
+/// codec this does not know — the same contract every other field here keeps.
+static NSNumber *FQVEBitDepth(CMFormatDescriptionRef format, FourCharCode codec) {
+    CFDictionaryRef atoms = (CFDictionaryRef)CMFormatDescriptionGetExtension(
+        format, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
+    if (!atoms) { return nil; }
+
+    if (codec == kCMVideoCodecType_HEVC) {
+        NSData *hvcC = (__bridge NSData *)CFDictionaryGetValue(atoms, CFSTR("hvcC"));
+        if (![hvcC isKindOfClass:[NSData class]] || hvcC.length < 18) { return nil; }
+        const uint8_t *bytes = (const uint8_t *)hvcC.bytes;
+        return @((bytes[17] & 0x07) + 8);
+    }
+
+    if (codec == kCMVideoCodecType_H264) {
+        NSData *avcC = (__bridge NSData *)CFDictionaryGetValue(atoms, CFSTR("avcC"));
+        if (![avcC isKindOfClass:[NSData class]] || avcC.length < 7) { return nil; }
+        const uint8_t *bytes = (const uint8_t *)avcC.bytes;
+        NSUInteger length = avcC.length;
+        uint8_t profile = bytes[1];
+        // Baseline, Main, Extended and anything else this knows are eight by
+        // the profile's own definition — there is no trailing block to read.
+        if (profile != 100 && profile != 110 && profile != 122 && profile != 144) {
+            return @8;
+        }
+        // Walk the parameter sets to reach the extension that follows them.
+        NSUInteger at = 5;
+        int sequenceSets = bytes[at++] & 0x1F;
+        for (int i = 0; i < sequenceSets; i++) {
+            if (at + 2 > length) { return nil; }
+            NSUInteger size = ((NSUInteger)bytes[at] << 8) | bytes[at + 1];
+            at += 2 + size;
+        }
+        if (at >= length) { return nil; }
+        int pictureSets = bytes[at++];
+        for (int i = 0; i < pictureSets; i++) {
+            if (at + 2 > length) { return nil; }
+            NSUInteger size = ((NSUInteger)bytes[at] << 8) | bytes[at + 1];
+            at += 2 + size;
+        }
+        // chroma_format, then bit_depth_luma_minus8 in the low three bits.
+        if (at + 2 > length) {
+            // A High-profile `avcC` written without its trailing block. Eight
+            // is the overwhelmingly common case, but "overwhelmingly common" is
+            // a guess, and this file does not make those.
+            return nil;
+        }
+        return @((bytes[at + 1] & 0x07) + 8);
+    }
+
+    return nil;
+}
+
+/// Everything the first video track's format description states.
+///
+/// **Keys are omitted rather than set to null**, so silence and "not asked"
+/// read the same on the far side — the same contract the Android map keeps.
+static NSDictionary *FQVEClipDetails(NSString *path) {
+    AVURLAsset *asset =
+        [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    AVAssetTrack *track = FQVEFirstTrack(asset, AVMediaTypeVideo);
+    if (!track) {
+        NSLog(@"FQVE: CLIP no video track in %@", path);
+        return nil;
+    }
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+
+    CMFormatDescriptionRef format =
+        (__bridge CMFormatDescriptionRef)[track.formatDescriptions firstObject];
+    if (format) {
+        out[@"codec"] = FQVECodecName(CMFormatDescriptionGetMediaSubType(format));
+        CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(format);
+        if (size.width > 0 && size.height > 0) {
+            out[@"width"] = @(size.width);
+            out[@"height"] = @(size.height);
+        }
+        NSString *primaries = FQVEPrimariesName((CFStringRef)CMFormatDescriptionGetExtension(
+            format, kCMFormatDescriptionExtension_ColorPrimaries));
+        if (primaries) { out[@"colorPrimaries"] = primaries; }
+        NSString *transfer = FQVETransferName((CFStringRef)CMFormatDescriptionGetExtension(
+            format, kCMFormatDescriptionExtension_TransferFunction));
+        if (transfer) { out[@"colorTransfer"] = transfer; }
+        CFBooleanRef full = (CFBooleanRef)CMFormatDescriptionGetExtension(
+            format, kCMFormatDescriptionExtension_FullRangeVideo);
+        if (full) {
+            out[@"colorRange"] = CFBooleanGetValue(full) ? @"full" : @"limited";
+        }
+        NSNumber *depth = FQVEBitDepth(format, CMFormatDescriptionGetMediaSubType(format));
+        if (depth) { out[@"bitDepth"] = depth; }
+    }
+
+    // **The stored size and the rotation kept apart**, the same convention the
+    // preview frame uses: one rotation decision in the system, applied by
+    // whoever draws. `preferredTransform` is the container's request.
+    CGAffineTransform t = track.preferredTransform;
+    double degrees = atan2(t.b, t.a) * 180.0 / M_PI;
+    int quarters = (int)llround(degrees / 90.0);
+    out[@"quarterTurns"] = @(((quarters % 4) + 4) % 4);
+
+    float fps = track.nominalFrameRate;
+    if (isfinite(fps) && fps > 0 && fps < 1000) {
+        out[@"frameRate"] = @((double)fps);
+    }
+    CMTime length = track.timeRange.duration;
+    if (CMTIME_IS_NUMERIC(length)) {
+        Float64 seconds = CMTimeGetSeconds(length);
+        if (isfinite(seconds) && seconds > 0) { out[@"seconds"] = @(seconds); }
+    }
+    float rate = track.estimatedDataRate;
+    if (isfinite(rate) && rate > 0) { out[@"bitsPerSecond"] = @((int)llround(rate)); }
+
+    return out;
 }
 
 /// This device's thermal state, on a scale both platforms share.
@@ -941,44 +1136,27 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 });
             });
         }
-        else if ([@"clipFrameRate" isEqualToString:call.method])
+        else if ([@"clipDetails" isEqualToString:call.method])
         {
-            // **`nominalFrameRate`, and Apple's own adjective is the honest one.**
-            // Action-camera footage is routinely variable-rate, so there may be
-            // no single number true of the whole clip. This one decides how much
-            // footage a strip of a given width spans — one dp about one frame —
-            // where being a frame or two out changes nothing a rider can see. It
-            // would be the wrong number for anything that had to land exactly.
+            // **One probe, every fact.** The rate, the codec and the color tags
+            // all come off one `CMFormatDescription`, so asking separately would
+            // parse the header once per question and let two answers about one
+            // file drift apart.
             //
-            // Off the platform thread for the reason `clipDuration` is: the asset
-            // parses its header on first ask.
+            // Off the platform thread for the reason `clipDuration` is: the
+            // asset parses its header on first ask.
             NSDictionary *args = (NSDictionary *)call.arguments;
             NSString *path = args[@"path"];
             if (![path isKindOfClass:[NSString class]]) {
-                result([FlutterError errorWithCode:@"clipFrameRate"
+                result([FlutterError errorWithCode:@"clipDetails"
                                            message:@"path is required"
                                            details:nil]);
                 return;
             }
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                NSNumber *fps = nil;
-                AVURLAsset *asset =
-                    [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-                AVAssetTrack *video = FQVEFirstTrack(asset, AVMediaTypeVideo);
-                if (video) {
-                    float rate = video.nominalFrameRate;
-                    // Zero is what a track with no stated rate reports, and a
-                    // caller dividing a strip width by this must not be handed
-                    // an infinity. Nothing said is what nil is for.
-                    if (isfinite(rate) && rate > 0 && rate < 1000) {
-                        fps = @((double)rate);
-                    }
-                }
-                if (!fps) {
-                    NSLog(@"FQVE: CLIP states no frame rate %@", path);
-                }
+                NSDictionary *details = FQVEClipDetails(path);
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    result(fps);
+                    result(details);
                 });
             });
         }

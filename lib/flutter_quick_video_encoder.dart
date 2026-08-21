@@ -77,6 +77,97 @@ class ClipPreviewFrame {
   String toString() => 'ClipPreviewFrame(${width}x$height)';
 }
 
+/// What a clip's container states about its picture track.
+///
+/// **Every field nullable, because silence is a real answer.** A container may
+/// say nothing about its color, its profile or its rate, and a plausible
+/// default is indistinguishable from a read value once it reaches a screen. A
+/// panel showing these renders the absence rather than inventing a filler.
+///
+/// **One shape, two platforms, and they do not always agree.** Measured on the
+/// same file: Apple's `nominalFrameRate` gives 29.970 where Android's
+/// `MediaFormat` gives 30.000, because the extractor stores an integer
+/// approximation of 30000/1001. Both are what that platform will decode with,
+/// which is the thing worth showing; neither is wrong. Anything comparing this
+/// across devices has to know it.
+class ClipDetails {
+  const ClipDetails({
+    this.codec,
+    this.width,
+    this.height,
+    this.quarterTurns = 0,
+    this.frameRate,
+    this.seconds,
+    this.bitDepth,
+    this.bitsPerSecond,
+    this.colorPrimaries,
+    this.colorTransfer,
+    this.colorRange,
+  });
+
+  /// `h264`, `hevc`, `prores` — the compression, lowercase and unadorned.
+  ///
+  /// **No profile beside it, deliberately.** Apple's format description does not
+  /// carry one without parsing the `avcC`/`hvcC` atom by hand, so a `profile`
+  /// field would have been permanently blank on one platform and populated on
+  /// the other — which reads as *this file does not say* when it means *we did
+  /// not look*. [bitDepth] carries the part of the profile that changes what
+  /// the film will be, and is answered on both.
+  final String? codec;
+
+  /// The stored edges, **before** [quarterTurns] is applied — the convention
+  /// [ClipPreviewFrame] uses, for the same reason: one rotation decision in the
+  /// system, applied by whoever draws.
+  final int? width;
+  final int? height;
+
+  /// Clockwise quarter turns the container asks for, 0–3.
+  final int quarterTurns;
+
+  /// Frames a second, nominal. See [FlutterQuickVideoEncoder.clipFrameRate].
+  final double? frameRate;
+
+  /// The picture track's length. [FlutterQuickVideoEncoder.clipDuration] is the
+  /// authority a trim handle is bounded by; this is the same number for a panel
+  /// to print, and is null in the cases that one exists to handle.
+  final double? seconds;
+
+  /// Bits per sample — 8 or 10 — when the container is specific enough to say.
+  final int? bitDepth;
+
+  final int? bitsPerSecond;
+
+  /// `bt709`, `bt2020`, `bt601` — which primaries the color is expressed in.
+  final String? colorPrimaries;
+
+  /// `sdr`, `hlg`, `pq`, `linear` — the transfer function.
+  ///
+  /// **This is the field that says HDR**, not the bit depth and not the
+  /// primaries. An eight-bit h264 tagged `hlg` is HDR-signalled footage, and
+  /// the corpus proxy this was developed against is exactly that.
+  final String? colorTransfer;
+
+  /// `limited` or `full`.
+  final String? colorRange;
+
+  /// Whether the transfer function is a high-dynamic-range one.
+  ///
+  /// **Null is not SDR.** It means the container stated no transfer at all,
+  /// which is the absence of a claim rather than a claim of ordinary range — and
+  /// a screen deciding what to say about the footage should know which of the
+  /// two it is looking at.
+  bool? get isHdr => switch (colorTransfer) {
+    null => null,
+    'hlg' || 'pq' => true,
+    _ => false,
+  };
+
+  @override
+  String toString() =>
+      'ClipDetails($codec ${width}x$height ${frameRate}fps '
+      '$bitDepth-bit $colorPrimaries/$colorTransfer)';
+}
+
 /// What asking for a clip's frame answered.
 ///
 /// **Three outcomes, because two of them used to be one value and they mean
@@ -378,6 +469,62 @@ class FlutterQuickVideoEncoder {
     return seconds;
   }
 
+  /// Everything the container states about a clip's picture track.
+  ///
+  /// **From the thing that will decode it**, which is what makes it worth
+  /// asking rather than reading the boxes in Dart: `MediaExtractor`'s
+  /// `MediaFormat` on Android, the video track's `CMFormatDescription` on
+  /// Apple. Those are the objects the export runs, so what they say is what the
+  /// film will actually be made from — the same argument [clipDuration]
+  /// documents at length.
+  ///
+  /// Every field is separately nullable, because a container is allowed to be
+  /// silent about any of them and a plausible default is indistinguishable from
+  /// a read value once it is on screen.
+  ///
+  /// One probe. [clipFrameRate] is a projection of this rather than a second
+  /// call, so a screen showing the details and a strip choosing its scale
+  /// cannot disagree.
+  static Future<ClipDetails?> clipDetails(String path) async {
+    final map = await _invokeMethod<Map<Object?, Object?>>('clipDetails', {
+      'path': path,
+    });
+    if (map == null) {
+      return null;
+    }
+    double? positive(Object? value) {
+      final number = value is num ? value.toDouble() : null;
+      if (number == null || !number.isFinite || number <= 0) {
+        return null;
+      }
+      return number;
+    }
+
+    int? counted(Object? value) {
+      final number = value is num ? value.toInt() : null;
+      return number == null || number <= 0 ? null : number;
+    }
+
+    String? named(Object? value) {
+      final text = value is String ? value.trim() : '';
+      return text.isEmpty ? null : text;
+    }
+
+    return ClipDetails(
+      codec: named(map['codec']),
+      width: counted(map['width']),
+      height: counted(map['height']),
+      quarterTurns: (counted(map['quarterTurns']) ?? 0) % 4,
+      frameRate: positive(map['frameRate']),
+      seconds: positive(map['seconds']),
+      bitDepth: counted(map['bitDepth']),
+      bitsPerSecond: counted(map['bitsPerSecond']),
+      colorPrimaries: named(map['colorPrimaries']),
+      colorTransfer: named(map['colorTransfer']),
+      colorRange: named(map['colorRange']),
+    );
+  }
+
   /// What [path] says its picture runs at, in frames a second, or null.
   ///
   /// **Nominal, and the word carries the whole caveat.** Action-camera footage
@@ -402,13 +549,12 @@ class FlutterQuickVideoEncoder {
   /// The first video track rather than the longest — a rate has no maximum
   /// worth taking, and two video tracks at different rates is not a file this
   /// has a policy for.
-  static Future<double?> clipFrameRate(String path) async {
-    final fps = await _invokeMethod<double>('clipFrameRate', {'path': path});
-    if (fps == null || !fps.isFinite || fps <= 0) {
-      return null;
-    }
-    return fps;
-  }
+  /// **A projection of [clipDetails], not a second call.** One probe answers
+  /// both, so a panel printing the rate and a filmstrip choosing its scale
+  /// cannot come back with different numbers — which is the way two accessors
+  /// onto one fact drift.
+  static Future<double?> clipFrameRate(String path) async =>
+      (await clipDetails(path))?.frameRate;
 
   /// The frame [path] shows at [at], as pixels a widget can draw.
   ///
