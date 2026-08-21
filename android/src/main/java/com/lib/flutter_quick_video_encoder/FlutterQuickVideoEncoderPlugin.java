@@ -581,6 +581,25 @@ public class FlutterQuickVideoEncoderPlugin implements
                             seconds -> mMainHandler.post(() -> result.success(seconds)));
                     break;
                 }
+                case "clipFrameRate":
+                {
+                    // **What the container claims, not what the frames do.** It
+                    // decides how much footage a strip of a given width should
+                    // span — one dp about one frame — so a variable-rate clip
+                    // being a frame or two out changes nothing visible. See
+                    // ClipDuration.frameRateOf.
+                    String ratePath = call.argument("path");
+                    if (ratePath == null) {
+                        result.error("clipFrameRate", "path is required", null);
+                        break;
+                    }
+                    if (mClipDurations == null) {
+                        mClipDurations = new ClipDuration();
+                    }
+                    mClipDurations.frameRateOf(ratePath,
+                            fps -> mMainHandler.post(() -> result.success(fps)));
+                    break;
+                }
                 case "stillAt":
                 {
                     // **A photograph decoded here rather than by the framework,

@@ -378,6 +378,38 @@ class FlutterQuickVideoEncoder {
     return seconds;
   }
 
+  /// What [path] says its picture runs at, in frames a second, or null.
+  ///
+  /// **Nominal, and the word carries the whole caveat.** Action-camera footage
+  /// is routinely variable-rate — a camera dropping frames in low light does
+  /// not announce it — so there may be no single number true of the whole clip.
+  /// This is what the container *claims*: `KEY_FRAME_RATE` from
+  /// `MediaExtractor` on Android, `AVAssetTrack.nominalFrameRate` on Apple,
+  /// whose own adjective is the honest one.
+  ///
+  /// **Right for choosing a scale, wrong for landing on a frame.** It exists so
+  /// a filmstrip of a given width can span the footage where one logical pixel
+  /// is about one frame — below that a strip cannot show detail the rider could
+  /// select, above it they cannot hit a frame. Being a frame or two out moves a
+  /// zoom level slightly and changes nothing anyone can see. Anything that must
+  /// land *on* a frame has to seek and take what it lands on, not compute from
+  /// this.
+  ///
+  /// **Null rather than a default**, because a plausible 30 is indistinguishable
+  /// from a read one, and 60 fps footage would then be scaled at half. A caller
+  /// that must have a number picks its own and knows it is picking.
+  ///
+  /// The first video track rather than the longest — a rate has no maximum
+  /// worth taking, and two video tracks at different rates is not a file this
+  /// has a policy for.
+  static Future<double?> clipFrameRate(String path) async {
+    final fps = await _invokeMethod<double>('clipFrameRate', {'path': path});
+    if (fps == null || !fps.isFinite || fps <= 0) {
+      return null;
+    }
+    return fps;
+  }
+
   /// The frame [path] shows at [at], as pixels a widget can draw.
   ///
   /// Null when the clip cannot be opened or decoded — the same conditions

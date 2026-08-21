@@ -941,6 +941,47 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                 });
             });
         }
+        else if ([@"clipFrameRate" isEqualToString:call.method])
+        {
+            // **`nominalFrameRate`, and Apple's own adjective is the honest one.**
+            // Action-camera footage is routinely variable-rate, so there may be
+            // no single number true of the whole clip. This one decides how much
+            // footage a strip of a given width spans — one dp about one frame —
+            // where being a frame or two out changes nothing a rider can see. It
+            // would be the wrong number for anything that had to land exactly.
+            //
+            // Off the platform thread for the reason `clipDuration` is: the asset
+            // parses its header on first ask.
+            NSDictionary *args = (NSDictionary *)call.arguments;
+            NSString *path = args[@"path"];
+            if (![path isKindOfClass:[NSString class]]) {
+                result([FlutterError errorWithCode:@"clipFrameRate"
+                                           message:@"path is required"
+                                           details:nil]);
+                return;
+            }
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                NSNumber *fps = nil;
+                AVURLAsset *asset =
+                    [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+                AVAssetTrack *video = FQVEFirstTrack(asset, AVMediaTypeVideo);
+                if (video) {
+                    float rate = video.nominalFrameRate;
+                    // Zero is what a track with no stated rate reports, and a
+                    // caller dividing a strip width by this must not be handed
+                    // an infinity. Nothing said is what nil is for.
+                    if (isfinite(rate) && rate > 0 && rate < 1000) {
+                        fps = @((double)rate);
+                    }
+                }
+                if (!fps) {
+                    NSLog(@"FQVE: CLIP states no frame rate %@", path);
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    result(fps);
+                });
+            });
+        }
         else if ([@"clipFrameAt" isEqualToString:call.method])
         {
             // One decode per scrub position, through the reader the export uses.
