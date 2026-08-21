@@ -33,12 +33,25 @@ import java.nio.ByteBuffer;
  * every frame, and that has to be visible rather than inferred from how long the
  * export took.
  *
- * <p><b>It rebuilds the decoder to seek rather than flushing it.</b>
- * {@code MediaCodec.flush()} in synchronous mode leaves the codec in a state
- * whose documented recovery — whether {@code start()} must follow — is read
- * differently by different codebases, and this code cannot be run on a device
- * before it ships. A seek happens about twice per film, a rebuild costs tens of
- * milliseconds, and the ambiguity disappears.
+ * <p><b>It flushes the decoder to seek, and rebuilds only when that is
+ * refused.</b> This used to rebuild always, on two grounds. The first still
+ * holds: {@code MediaCodec.flush()} leaves a synchronous codec in the Flushed
+ * sub-state and whether {@code start()} must follow is written down differently
+ * in different places. The second — "this code cannot be run on a device before
+ * it ships" — was the one doing the work, and it has expired. An ambiguity you
+ * can settle by running it is not an ambiguity; it is an unrun experiment.
+ *
+ * <p>What changed the arithmetic is who seeks. **A seek happens about twice per
+ * film and a rebuild costs tens of milliseconds — for an export.** The Clips
+ * screen seeks on every backward drag of a trim handle, where a rebuild is
+ * 1.5 s at any distance on a 4K clip, and the rider is holding the handle. Same
+ * code, two workloads, and the cheap answer for one is the whole cost of the
+ * other.
+ *
+ * <p>The fallback is kept rather than removed, and which path ran is on the
+ * seek line and in the close line — see {@link #flushDecoder}, and
+ * CLIPS-UI-PLAN §7.3, which asked for exactly that because a flush that quietly
+ * fails looks identical to one that worked.
  */
 final class ClipReader {
 
@@ -228,8 +241,12 @@ final class ClipReader {
     }
 
     void close() {
+        // **The split, not just the total.** `seeks=` alone cannot tell a reader
+        // that reused its decoder from one that rebuilt every time, and those
+        // differ by about 1.5 s a seek on a 4K clip. See `flushDecoder`.
         Log.i(TAG, "CLIP close " + path
-                + " decoded=" + decodedFrames + " seeks=" + seekCount);
+                + " decoded=" + decodedFrames + " seeks=" + seekCount
+                + " flushed=" + flushedSeeks + " rebuilt=" + rebuiltSeeks);
         releaseDecoder();
         try {
             extractor.release();
@@ -247,17 +264,93 @@ final class ClipReader {
 
     private void seekTo(long timeUs) throws IOException {
         extractor.seekTo(Math.max(0L, timeUs), MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
-        releaseDecoder();
         current = null;
         ahead = null;
         inputDone = false;
         outputDone = false;
         seekCount++;
-        startDecoder();
+        final boolean flushed = flushDecoder();
+        if (flushed) {
+            flushedSeeks++;
+        } else {
+            releaseDecoder();
+            startDecoder();
+            rebuiltSeeks++;
+        }
         Log.i(TAG, "CLIP seek " + path + " to " + timeUs + "us"
                 + " landed=" + extractor.getSampleTime() + "us"
+                + " via=" + (flushed ? "flush" : "rebuild")
                 + " total=" + seekCount);
     }
+
+    /**
+     * Reuse the decoder across a seek instead of building another one.
+     *
+     * <p><b>The class comment above declined this on two grounds and only one of
+     * them still holds.</b> The ambiguity is real: {@code flush()} leaves a
+     * synchronous codec in the Flushed sub-state, and whether {@code start()}
+     * must follow is written down differently in different places. The other
+     * ground — "this code cannot be run on a device before it ships" — has
+     * expired, and it was the one doing the work. So the ambiguity is settled by
+     * trying it on a device rather than by reading about it, and by keeping the
+     * rebuild underneath as the answer when it does not hold.
+     *
+     * <p><b>No {@code start()} after the flush, and the device settled that.**
+     * The requirement is real in *asynchronous* mode and the class comment's
+     * ambiguity was about whether it carries over. It does not: this reader
+     * dequeues its own buffers, which is synchronous mode, and an S24 Ultra
+     * answers a {@code start()} there with
+     * {@code IllegalStateException: start() is valid only at Configured state;
+     * currently at Running state}. A flush leaves it Running and ready.
+     *
+     * <p>That was found by writing the call in, running it, and reading the log
+     * — the first version of this method called {@code start()} unconditionally
+     * on the theory that it was required-or-redundant, and every seek fell back
+     * to the rebuild while producing correct frames at the old speed. Which is
+     * the failure this method's own instrumentation exists to make visible, met
+     * on the first run, by the person who wrote it.
+     *
+     * <p>The catch stays regardless. A device that refuses a flush for some
+     * other reason gets the rebuild that has always worked, and
+     * {@link #releaseDecoder} means the fallback starts from nothing rather
+     * than from whatever the flush left behind.
+     *
+     * <p><b>Counted and named on the line, because the failure mode here is
+     * silence.</b> A flush that quietly fails and rebuilds is indistinguishable
+     * from an optimization that worked — same pixels, same timings, and the only
+     * evidence is that nothing got faster. So the seek line carries
+     * {@code via=flush} or {@code via=rebuild} and [close] reports the totals.
+     * CLIPS-UI-PLAN §7.3 asked for exactly that, in those words.
+     *
+     * <p>Safe on the extractor side because the caller has already sought to a
+     * sync sample: after a flush the first data fed must start at a stream
+     * boundary, and {@code SEEK_TO_PREVIOUS_SYNC} is what guarantees one.
+     */
+    private boolean flushDecoder() {
+        if (codec == null) {
+            return false;
+        }
+        try {
+            codec.flush();
+            return true;
+        } catch (Exception e) {
+            // Named once rather than counted silently: a device where this
+            // never works should say which call refused and why, or the only
+            // symptom is a `flushed=0` nobody can act on.
+            if (!loggedFlushFailure) {
+                loggedFlushFailure = true;
+                Log.w(TAG, "CLIP flush refused on this device, rebuilding"
+                        + " instead: " + e);
+            }
+            return false;
+        }
+    }
+
+    /** So a device that refuses every flush says so once, not once a seek. */
+    private boolean loggedFlushFailure;
+
+    private int flushedSeeks;
+    private int rebuiltSeeks;
 
     private void startDecoder() throws IOException {
         // Asked for again rather than reused. `getTrackFormat` builds a fresh
