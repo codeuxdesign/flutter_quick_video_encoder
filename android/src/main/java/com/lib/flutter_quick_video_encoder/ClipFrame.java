@@ -66,18 +66,63 @@ final class ClipFrame {
      */
     final boolean tenBit;
 
+    /**
+     * How far a luma coordinate shifts right to index chroma: 1 for a 4:2:0
+     * frame, 0 for one whose chroma is already per-pixel.
+     *
+     * <p><b>A field rather than the literal `>> 1` it replaces, and the preview
+     * path is why.</b> A preview samples a handful of the source's pixels — 320
+     * of 3840 across — and the chroma each of those wants is at
+     * `sourceX >> 1`, which for adjacent output pixels is six samples apart.
+     * A half-size chroma plane cannot hold that: two neighbours would collapse
+     * onto one entry and the picture would differ from the export's. So a
+     * sampled frame carries one chroma sample per pixel and shifts by nothing,
+     * while a decoded frame is 4:2:0 and shifts by one. Both then read through
+     * the same [rgbAt].
+     */
+    final int chromaShift;
+
     ClipFrame(short[] luma, short[] cb, short[] cr, int width, int height,
+              ClipColor color, long presentationTimeUs, boolean tenBit) {
+        this(luma, cb, cr, width, height, (width + 1) / 2, (height + 1) / 2, 1,
+                color, presentationTimeUs, tenBit);
+    }
+
+    ClipFrame(short[] luma, short[] cb, short[] cr, int width, int height,
+              int chromaWidth, int chromaHeight, int chromaShift,
               ClipColor color, long presentationTimeUs, boolean tenBit) {
         this.luma = luma;
         this.cb = cb;
         this.cr = cr;
         this.width = width;
         this.height = height;
-        this.chromaWidth = (width + 1) / 2;
-        this.chromaHeight = (height + 1) / 2;
+        this.chromaWidth = chromaWidth;
+        this.chromaHeight = chromaHeight;
+        this.chromaShift = chromaShift;
         this.color = color;
         this.presentationTimeUs = presentationTimeUs;
         this.tenBit = tenBit;
+    }
+
+    /**
+     * An 8-bit sample as a ten-bit code, by the file's own range.
+     *
+     * <p>**Moved here from `ClipReader` so the sampler can share it**, and
+     * because widening to the ten bits this class stores is this class's
+     * business. `ClipReader` still calls it under its own name.
+     *
+     * <p>A limited-range file shifts; a full-range one scales. Shifting a
+     * full-range sample would leave white at 1020 of 1023, so every non-zero
+     * sample decodes one low and white comes back 254 — a uniform darkening
+     * with nothing logged, and the corpus has full-range files in it.
+     *
+     * <p>The full-range form is a ceiling rather than a round, because
+     * {@link ClipColor}'s integer path floors on the way back to 8 bits. The
+     * widened code has to sit at or above the exact {@code v * 1023 / 255} to
+     * survive that floor; rounding puts half the values a fraction below it.
+     */
+    static short widen(int eightBit, boolean fullRange) {
+        return (short) (fullRange ? (eightBit * 1023 + 254) / 255 : eightBit << 2);
     }
 
     /**
@@ -91,7 +136,7 @@ final class ClipFrame {
      */
     int rgbAt(int sx, int sy) {
         final int y = luma[sy * width + sx] & 0x3FF;
-        final int ci = (sy >> 1) * chromaWidth + (sx >> 1);
+        final int ci = (sy >> chromaShift) * chromaWidth + (sx >> chromaShift);
         return color.toRgb(y, cb[ci] & 0x3FF, cr[ci] & 0x3FF);
     }
 }

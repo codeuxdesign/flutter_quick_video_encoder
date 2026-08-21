@@ -87,6 +87,60 @@ public class ClipDecodeSplitTest {
         COPY,
     }
 
+    /**
+     * The same clip through the real reader, full gather against sampled.
+     *
+     * <p><b>The arms above price the stages; this prices the fix.</b> They call
+     * `copyPlane` directly, which proves where the cost is and not that the
+     * plugin's own path got cheaper — `ClipReader.samplePreview` is private and
+     * reached only through `frameAtTime`, so the only honest way to measure it
+     * is to drive the reader both ways over the same clip.
+     *
+     * <p>`gatherAtMost(320)` is the edge the Clips screen actually requests.
+     * `gatherAtMost(0)` is what the export uses and what the preview used to.
+     */
+    @Test
+    public void samplingTheGatherIsCheaperThroughTheRealReader() throws Exception {
+        final File clip = new File(CLIP);
+        if (!clip.exists()) {
+            Log.w(TAG, "CLIPGATHER skipped — no clip at " + CLIP);
+            return;
+        }
+        final double whole = readerRun(clip, 0);
+        final double sampled = readerRun(clip, 320);
+        final double frameMs = 1001.0 / 30.0;
+        Log.i(TAG, String.format(
+                "CLIPGATHER 3840x2160 hevc-main10 frames=%d"
+                        + " whole=%.1fms/%.2fx sampled=%.1fms/%.2fx saved=%.1fms %.1fx",
+                MEASURED, whole, whole / frameMs, sampled, sampled / frameMs,
+                whole - sampled, sampled == 0 ? 0 : whole / sampled));
+        assertTrue("the sampled gather measured nothing", sampled > 0);
+    }
+
+    /** Milliseconds per frame walking forward through the reader. */
+    private double readerRun(File clip, int maxEdge) throws Exception {
+        final ClipReader reader = new ClipReader(clip.getAbsolutePath());
+        try {
+            reader.gatherAtMost(maxEdge);
+            long nanos = 0;
+            // Consecutive frames at the file's own cadence, so neither arm pays
+            // for a seek the other did not.
+            for (int i = 0; i < WARMUP + MEASURED; i++) {
+                final long at = i * 1_001_000L / 30L;
+                final long started = System.nanoTime();
+                final ClipFrame frame = reader.frameAtTime(at);
+                final long spent = System.nanoTime() - started;
+                assertTrue("no frame at " + at, frame != null);
+                if (i >= WARMUP) {
+                    nanos += spent;
+                }
+            }
+            return nanos / (double) MEASURED / 1e6;
+        } finally {
+            reader.close();
+        }
+    }
+
     @Test
     public void whereAndroidsPerFrameClipCostActuallyGoes() throws Exception {
         final File clip = new File(CLIP);

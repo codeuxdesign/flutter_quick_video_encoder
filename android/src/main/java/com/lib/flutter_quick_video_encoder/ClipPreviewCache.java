@@ -127,7 +127,15 @@ final class ClipPreviewCache {
             }
             ClipPreview.Image image = null;
             try {
-                image = ClipPreview.from(readerFor(path).frameAtTime(timeUs), maxEdge);
+                // **Told before it decodes, not asked afterwards.** The reader
+                // gathers at this edge instead of gathering the whole 4K frame
+                // for `from` to take 320 pixels out of — 91% of a preview's
+                // cost, measured; see `ClipReader.samplePreview`. `from` still
+                // runs, over a frame already at its size, which is identity
+                // sampling and leaves the pixels exactly as they were.
+                final ClipReader reader = readerFor(path);
+                reader.gatherAtMost(maxEdge);
+                image = ClipPreview.from(reader.frameAtTime(timeUs), maxEdge);
             } catch (Exception e) {
                 // The reader is dropped rather than kept, because a decode that
                 // threw leaves it at an instant nobody can name — reusing it

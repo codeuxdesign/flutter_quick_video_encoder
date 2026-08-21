@@ -98,6 +98,20 @@ final class ClipPreview {
     }
 
     /** One edge of the frame, scaled so that [longest] lands on [maxEdge]. */
+    /**
+     * The output edge this would choose, exposed so the sampler can choose the
+     * same one.
+     *
+     * <p><b>Shared rather than re-derived, because the two must agree exactly.**
+     * `ClipReader`'s preview sampler gathers a frame at this size and [from]
+     * then runs over it at its own size — identity sampling, byte-identical to
+     * the full-resolution path. One pixel of disagreement here and it is not
+     * identity any more, and the preview quietly stops matching the export.
+     */
+    static int outputEdge(int edge, int longest, int maxEdge) {
+        return scaled(edge, longest, maxEdge);
+    }
+
     private static int scaled(int edge, int longest, int maxEdge) {
         if (longest <= maxEdge) {
             return edge;

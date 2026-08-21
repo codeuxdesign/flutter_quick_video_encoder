@@ -78,6 +78,36 @@ final class ClipReader {
     private boolean colorFromOutputFormat;
 
     /** The frame covering the last requested instant. */
+    /**
+     * The longest edge a frame is gathered at, or 0 to gather all of it.
+     *
+     * <p>Zero for the export, which composites at full size. Set by
+     * `ClipPreviewCache` to the edge it is about to ask `ClipPreview.from` for,
+     * so the gather stops being 200:1 larger than what gets read — see
+     * [samplePreview].
+     */
+    private int previewMaxEdge;
+
+    /**
+     * Gather at [maxEdge] from here on, or at full size when it is 0.
+     *
+     * <p><b>Drops the held frames when it changes</b>, because they were
+     * gathered at the old size and [frameAtTime] would hand one straight back
+     * — a preview at the wrong resolution, or an export handed a thumbnail.
+     * Idempotent, so a cache that sets the same edge on every scrub costs
+     * nothing and does not throw away the frame it is about to reuse.
+     */
+    void gatherAtMost(int maxEdge) {
+        if (maxEdge == previewMaxEdge) {
+            return;
+        }
+        previewMaxEdge = maxEdge;
+        current = null;
+        ahead = null;
+        slotA = null;
+        slotB = null;
+    }
+
     private ClipFrame current;
     /** The first decoded frame past that instant, kept so it is not decoded twice. */
     private ClipFrame ahead;
@@ -460,13 +490,21 @@ final class ClipReader {
 
         final int chromaWidth = width / 2;
         final int chromaHeight = height / 2;
-        final short[][] slot = slotFor(width, height, chromaWidth, chromaHeight);
 
         final Image.Plane[] planes = image.getPlanes();
         logLayoutOnce(image, planes, format, left, top, width, height);
         // The file's own range decides how an 8-bit sample widens, so it has to
         // travel with the copy rather than be assumed by it.
         final boolean fullRange = color != null && color.fullRange;
+
+        // Before the slot, because a preview allocates its own and a slot sized
+        // for 4K is 25 MB nobody is going to read.
+        if (previewMaxEdge > 0) {
+            return samplePreview(planes, left, top, width, height, tenBit,
+                    fullRange, presentationTimeUs);
+        }
+
+        final short[][] slot = slotFor(width, height, chromaWidth, chromaHeight);
         copyPlane(planes[0].getBuffer(), planes[0].getRowStride(), planes[0].getPixelStride(),
                 slot[0], left, top, width, height, tenBit, fullRange);
         copyPlane(planes[1].getBuffer(), planes[1].getRowStride(), planes[1].getPixelStride(),
@@ -538,7 +576,108 @@ final class ClipReader {
      * 256 inputs, which is what a clip that was 8-bit all along deserves.
      */
     private static short widen(int eightBit, boolean fullRange) {
-        return (short) (fullRange ? (eightBit * 1023 + 254) / 255 : eightBit << 2);
+        return ClipFrame.widen(eightBit, fullRange);
+    }
+
+    /**
+     * Gather only the samples a preview will read, instead of all of them.
+     *
+     * <p><b>The measured defect: a 200:1 over-gather.</b> `copyPlane` widens the
+     * whole frame — 8.3 million luma samples at 4K — so that `ClipPreview.from`
+     * can sample about 57,600 of them at the `maxEdge` the Clips screen asks
+     * for. `ClipDecodeSplitTest` priced the three stages on an S24 Ultra with a
+     * real 4K HEVC Main 10 clip: the hardware decode is **2.2 ms a frame**,
+     * `getOutputImage` adds **2.1 ms**, and this copy was **44.5 ms** — 91% of
+     * the cost, and the reason 1x playback cost about 1x realtime there.
+     * CLIPS-UI-PLAN §7 has the row and what it retired.
+     *
+     * <p><b>The export is untouched and must be.</b> It composites at full size
+     * and genuinely needs every sample; only the preview reads a thumbnail's
+     * worth. So this is behind [previewMaxEdge], which `ClipPreviewCache` sets
+     * and `ClipCompositor` never does — and they hold different readers, so
+     * neither can inherit the other's mode.
+     *
+     * <p><b>Byte-identical by construction rather than by approximation.</b> It
+     * picks exactly the source samples `ClipPreview.from` would have picked:
+     * the same half-pixel offset, the same truncating cast, the same
+     * `outputEdge`. Chroma is taken at the *luma* coordinate's `>> 1`, which is
+     * why the frame it builds carries one chroma sample per pixel and a
+     * [ClipFrame.chromaShift] of zero — see the note there. `from` then runs
+     * over a frame already at its target size, which is identity sampling, so
+     * the pixels are the full path's pixels. `ClipPreviewSampleTest` asserts
+     * that against the full path rather than trusting this paragraph.
+     */
+    private ClipFrame samplePreview(Image.Plane[] planes, int left, int top,
+                                    int width, int height, boolean tenBit,
+                                    boolean fullRange, long presentationTimeUs) {
+        final int longest = Math.max(width, height);
+        final int outW = ClipPreview.outputEdge(width, longest, previewMaxEdge);
+        final int outH = ClipPreview.outputEdge(height, longest, previewMaxEdge);
+
+        final short[] luma = new short[outW * outH];
+        final short[] cb = new short[outW * outH];
+        final short[] cr = new short[outW * outH];
+
+        final ByteBuffer yBuf = planes[0].getBuffer();
+        final ByteBuffer uBuf = planes[1].getBuffer();
+        final ByteBuffer vBuf = planes[2].getBuffer();
+
+        for (int y = 0; y < outH; y++) {
+            // The half-pixel offset and the truncating cast are `ClipPreview`'s,
+            // copied rather than re-derived for the reason its own comment
+            // gives: rounding where the other floors shifts the picture half a
+            // pixel against the film at exactly the sizes anyone would notice.
+            final float v = (y + 0.5f) / outH;
+            int sy = (int) (v * height);
+            if (sy < 0) {
+                sy = 0;
+            } else if (sy >= height) {
+                sy = height - 1;
+            }
+            final int lumaRow = top + sy;
+            final int chromaRow = (top / 2) + (sy >> 1);
+            final int out = y * outW;
+            for (int x = 0; x < outW; x++) {
+                final float u = (x + 0.5f) / outW;
+                int sx = (int) (u * width);
+                if (sx < 0) {
+                    sx = 0;
+                } else if (sx >= width) {
+                    sx = width - 1;
+                }
+                final int chromaCol = (left / 2) + (sx >> 1);
+                luma[out + x] = sampleAt(yBuf, planes[0].getRowStride(),
+                        planes[0].getPixelStride(), left + sx, lumaRow, tenBit,
+                        fullRange);
+                cb[out + x] = sampleAt(uBuf, planes[1].getRowStride(),
+                        planes[1].getPixelStride(), chromaCol, chromaRow, tenBit,
+                        fullRange);
+                cr[out + x] = sampleAt(vBuf, planes[2].getRowStride(),
+                        planes[2].getPixelStride(), chromaCol, chromaRow, tenBit,
+                        fullRange);
+            }
+        }
+
+        return new ClipFrame(luma, cb, cr, outW, outH, outW, outH, 0,
+                color, presentationTimeUs, tenBit);
+    }
+
+    /**
+     * One sample, widened the way {@link #copyPlane} widens it.
+     *
+     * <p>Ten bits sit in the high bits of a little-endian 16-bit word, so the
+     * sample is the pair shifted back down by six — not the top byte, which
+     * silently costs two bits on every HDR clip.
+     */
+    private static short sampleAt(ByteBuffer buffer, int rowStride, int pixelStride,
+                                  int x, int y, boolean tenBit, boolean fullRange) {
+        final int at = y * rowStride + x * pixelStride;
+        if (tenBit) {
+            final int lo = buffer.get(at) & 0xFF;
+            final int hi = buffer.get(at + 1) & 0xFF;
+            return (short) ((((hi << 8) | lo) >> 6) & 0x3FF);
+        }
+        return ClipFrame.widen(buffer.get(at) & 0xFF, fullRange);
     }
 
     static void copyPlane(ByteBuffer buffer, int rowStride, int pixelStride, short[] out,
