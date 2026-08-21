@@ -77,6 +77,64 @@ class ClipPreviewFrame {
   String toString() => 'ClipPreviewFrame(${width}x$height)';
 }
 
+/// What asking for a clip's frame answered.
+///
+/// **Three outcomes, because two of them used to be one value and they mean
+/// opposite things.** A nullable frame collapsed *this clip has no picture to
+/// give* and *your call was dropped because you let go* into a single `null`,
+/// which was invisible while the only caller was a handle preview: it redraws
+/// either way, so it could not tell and did not care.
+///
+/// A caller that *keeps* the answer can tell, and the difference is the whole
+/// meaning of what it keeps. The clip stills cache logged every retired decode
+/// as a damaged file, so one rider stepping to the next wizard step while eight
+/// cold clips were still decoding wrote eight lines about eight healthy files —
+/// two states behind one message, which is what docs/SILENT-FAILURES.md is a
+/// list of.
+///
+/// Sealed, so the compiler names every place that has to decide rather than
+/// letting a caller keep treating the absent case as one thing.
+sealed class ClipFrameOutcome {
+  const ClipFrameOutcome();
+}
+
+/// The frame, decoded.
+class ClipFrameReady extends ClipFrameOutcome {
+  const ClipFrameReady(this.frame);
+
+  final ClipPreviewFrame frame;
+
+  @override
+  String toString() => 'ClipFrameReady($frame)';
+}
+
+/// The clip has no picture to give at that instant.
+///
+/// A container that will not open, a file that has moved, a device with no
+/// decoder for it. **A fact about the clip**, so it is worth reporting and
+/// worth remembering.
+class ClipFrameNone extends ClipFrameOutcome {
+  const ClipFrameNone();
+
+  @override
+  String toString() => 'ClipFrameNone()';
+}
+
+/// The call was dropped because the screen that asked let go.
+///
+/// **A fact about the caller, not about the clip.** The decode was correct and
+/// unfinished; asking again answers normally. Nothing about this should be
+/// stored, and nothing about it should be reported as a damaged file.
+///
+/// Produced whenever [releaseClipPreviews] runs while decodes are queued, which
+/// is routine: a rider stepping off the clips screen retires the backlog.
+class ClipFrameRetired extends ClipFrameOutcome {
+  const ClipFrameRetired();
+
+  @override
+  String toString() => 'ClipFrameRetired()';
+}
+
 /// One photograph, decoded to bounded RGBA by the platform.
 ///
 /// **Carries what it is, not just what it holds.** [format] and [colorSpace]
@@ -450,7 +508,7 @@ class FlutterQuickVideoEncoder {
     );
   }
 
-  static Future<ClipPreviewFrame?> clipFrameAt(
+  static Future<ClipFrameOutcome> clipFrameAt(
     String path,
     Duration at, {
     int maxEdge = 512,
@@ -468,12 +526,19 @@ class FlutterQuickVideoEncoder {
       'maxEdge': maxEdge,
     });
     if (result == null) {
-      return null;
+      return const ClipFrameNone();
     }
-    return ClipPreviewFrame(
-      rgba: result['rgba'] as Uint8List,
-      width: result['width'] as int,
-      height: result['height'] as int,
+    // A map carrying the flag and no pixels. Checked before the cast below,
+    // which would otherwise throw on the missing `rgba`.
+    if (result['retired'] == true) {
+      return const ClipFrameRetired();
+    }
+    return ClipFrameReady(
+      ClipPreviewFrame(
+        rgba: result['rgba'] as Uint8List,
+        width: result['width'] as int,
+        height: result['height'] as int,
+      ),
     );
   }
 

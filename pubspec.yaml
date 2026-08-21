@@ -3,9 +3,21 @@ description: Encode raw RGB images to mp4 video using hardware h264 encoders. Al
 version: 1.7.2
 homepage: https://github.com/chipweinberger/flutter_quick_video_encoder
 
+# **Dart 3, for sealed classes — the one deliberate departure from upstream's
+# constraint.** `clipFrameAt` answers with a sealed `ClipFrameOutcome`, and
+# exhaustiveness checking is what makes that worth doing: a caller cannot
+# quietly treat "this clip has no picture" and "your call was retired" as one
+# case, which is exactly the bug the type replaced. Exhaustiveness needs
+# language 3.0 in the library that *declares* the type, so 2.15.1 here silently
+# turned the compiler check off in every consumer while the code still compiled.
+#
+# The repo-wide SDK bump in .claude/rules/dart-style.md deliberately skips
+# `third_party/`, because a vendored fork's constraint belongs upstream. This is
+# not that bump: it is the floor an API added in this fork requires. Kept as low
+# as it can be rather than matched to the app's ^3.13.0, so it stays mergeable.
 environment:
-  sdk: ">=2.15.1 <4.0.0"
-  flutter: ">=2.5.0"
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.10.0"
 
 dependencies:
   flutter:

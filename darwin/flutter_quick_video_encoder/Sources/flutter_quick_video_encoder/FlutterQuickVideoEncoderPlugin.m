@@ -513,10 +513,22 @@ static NSData *FQVEClipPreviewRgba(CVPixelBufferRef clip,
 /// because it also serializes access to the readers for free: there are no locks
 /// in here and there is nothing to get wrong.
 @interface FQVEClipPreviews : NSObject
+/// Decodes one frame, or says why it did not.
+///
+/// **[retired] is not the same as a nil frame, and telling them apart is the
+/// point.** A nil frame says this clip has no picture to give — damaged, or a
+/// container that will not open — and a caller may log it or remember not to
+/// ask again. Retired says nothing about the clip at all: the decode was
+/// correct and unfinished, dropped because the screen that asked let go, and
+/// asking again in a moment answers normally.
+///
+/// They were one value while the only caller was a handle preview, which
+/// redraws either way. A caller that *keeps* the answer can tell: the clip
+/// stills cache logged every retired decode as a damaged file.
 - (void)frameAtPath:(NSString *)path
              timeUs:(int64_t)timeUs
             maxEdge:(int)maxEdge
-         completion:(void (^)(NSData *rgba, int width, int height))completion;
+         completion:(void (^)(NSData *rgba, int width, int height, BOOL retired))completion;
 /// Closes every reader, and does not return until they are closed.
 - (void)releaseReaders;
 /// Closes every reader without holding up the thread that asked.
@@ -568,7 +580,7 @@ static const NSTimeInterval kFQVEPreviewIdleSeconds = 20.0;
 - (void)frameAtPath:(NSString *)path
              timeUs:(int64_t)timeUs
             maxEdge:(int)maxEdge
-         completion:(void (^)(NSData *, int, int))completion
+         completion:(void (^)(NSData *, int, int, BOOL))completion
 {
     uint64_t round = atomic_load(&_generation);
     dispatch_async(_queue, ^{
@@ -577,11 +589,11 @@ static const NSTimeInterval kFQVEPreviewIdleSeconds = 20.0;
         int height = 0;
 
         // Queued for a screen that has since gone away. Answered rather than
-        // dropped, because the call still has a `result` waiting on it, and nil
-        // is the answer the caller already handles — the same one a clip with no
-        // picture gives.
+        // dropped, because the call still has a `result` waiting on it — but
+        // answered as *retired* rather than as a clip with no picture, which is
+        // a different fact and the one a caller that keeps its answer needs.
         if (atomic_load(&self->_generation) != round) {
-            completion(nil, 0, 0);
+            completion(nil, 0, 0, YES);
             return;
         }
 
@@ -599,7 +611,7 @@ static const NSTimeInterval kFQVEPreviewIdleSeconds = 20.0;
             }
         }
 
-        completion(rgba, width, height);
+        completion(rgba, width, height, NO);
         [self sweepLater];
     });
 }
@@ -954,8 +966,16 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
             [self.mClipPreviews frameAtPath:path
                                      timeUs:atUs.longLongValue
                                     maxEdge:maxEdge.intValue
-                                 completion:^(NSData *rgba, int width, int height) {
+                                 completion:^(NSData *rgba, int width, int height, BOOL retired) {
                 dispatch_async(dispatch_get_main_queue(), ^{
+                    if (retired) {
+                        // A map with no pixels, rather than nil. Dart reads the
+                        // flag and hands back a retired outcome, which is a
+                        // different answer from "this clip has no picture" —
+                        // the whole point of the split.
+                        result(@{@"retired" : @YES});
+                        return;
+                    }
                     if (!rgba) {
                         result(nil);
                         return;

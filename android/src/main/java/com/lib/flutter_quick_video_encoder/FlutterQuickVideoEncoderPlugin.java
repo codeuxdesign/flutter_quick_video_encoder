@@ -518,18 +518,42 @@ public class FlutterQuickVideoEncoderPlugin implements
                     // Answered from the worker thread, so the platform thread is
                     // free to keep drawing the handle that asked. `result` is not
                     // thread-safe, hence the hop back.
+                    // An anonymous class rather than a lambda, because `Delivery`
+                    // answers two different things now: a frame that may be
+                    // absent, and a call that was retired because the screen let
+                    // go. See `ClipPreviewCache.Delivery.onRetired`.
                     mClipPreviews.frameAt(path, atUs.longValue(), maxEdge.intValue(),
-                            image -> mMainHandler.post(() -> {
-                                if (image == null) {
-                                    result.success(null);
-                                    return;
+                            new ClipPreviewCache.Delivery() {
+                                @Override
+                                public void onImage(ClipPreview.Image image) {
+                                    mMainHandler.post(() -> {
+                                        if (image == null) {
+                                            result.success(null);
+                                            return;
+                                        }
+                                        Map<String, Object> frame = new java.util.LinkedHashMap<>();
+                                        frame.put("rgba", image.rgba);
+                                        frame.put("width", image.width);
+                                        frame.put("height", image.height);
+                                        result.success(frame);
+                                    });
                                 }
-                                Map<String, Object> frame = new java.util.LinkedHashMap<>();
-                                frame.put("rgba", image.rgba);
-                                frame.put("width", image.width);
-                                frame.put("height", image.height);
-                                result.success(frame);
-                            }));
+
+                                @Override
+                                public void onRetired() {
+                                    // A map with no pixels, rather than null. Dart
+                                    // reads the flag and hands back a retired
+                                    // outcome, which is a different answer from
+                                    // "this clip has no picture" — the whole point
+                                    // of the split.
+                                    mMainHandler.post(() -> {
+                                        Map<String, Object> retired =
+                                                new java.util.LinkedHashMap<>();
+                                        retired.put("retired", true);
+                                        result.success(retired);
+                                    });
+                                }
+                            });
                     break;
                 }
                 case "clipDuration":

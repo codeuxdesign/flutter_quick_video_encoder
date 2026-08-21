@@ -63,6 +63,26 @@ final class ClipPreviewCache {
     interface Delivery {
         /** The frame, or null when the clip could not be opened or decoded. */
         void onImage(ClipPreview.Image image);
+
+        /**
+         * The call was dropped because the screen that asked has since let go.
+         *
+         * <p><b>Separate from a null frame, because the two mean opposite things
+         * to a caller that keeps what it gets.</b> A null says this clip has no
+         * picture to give — the file is damaged, or the container will not open
+         * — and a caller may reasonably log it, show a placeholder, or remember
+         * not to ask again. Retired says nothing whatever about the clip: the
+         * decode was correct and unfinished, and asking again in a moment will
+         * answer normally.
+         *
+         * <p>They were one value while the only caller was a handle preview,
+         * which redraws either way and so could not tell the difference or care.
+         * A caller that *stores* the answer can: the clip stills cache logged
+         * every retired decode as a damaged file, and one rider stepping to the
+         * next wizard step while eight cold clips were still decoding produced
+         * eight such lines about eight healthy files.
+         */
+        void onRetired();
     }
 
     private final ScheduledExecutorService worker =
@@ -118,11 +138,12 @@ final class ClipPreviewCache {
         final long round = generation.get();
         worker.execute(() -> {
             // Queued for a screen that has since gone away. Answered rather than
-            // dropped, because the call still has a `result` waiting on it, and
-            // null is the answer the caller already handles — the same one a clip
-            // with no picture gives.
+            // dropped, because the call still has a `result` waiting on it — but
+            // answered as *retired* rather than as a clip with no picture, which
+            // is a different fact and is the one a caller that keeps its answer
+            // needs. See {@link Delivery#onRetired}.
             if (generation.get() != round) {
-                delivery.onImage(null);
+                delivery.onRetired();
                 return;
             }
             ClipPreview.Image image = null;
