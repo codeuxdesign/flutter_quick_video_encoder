@@ -1759,6 +1759,28 @@ typedef NS_ENUM(NSUInteger, LogLevel) {
                                                   }];
     [audioReader addOutput:audioOutput];
 
+    // **Clamped to the video, which is `-shortest` and was missing.** The score
+    // is generated to the film's length and lands a little past it — 27 ms on a
+    // measured 113 s export, under one frame at 30 fps. Read whole, that tail
+    // becomes the *container's* duration, so the timeline runs past the last
+    // video sample and there is a sliver with no picture in it.
+    //
+    // What a player does there is its own business, and they disagree:
+    // QuickTime paints black, others hold the last frame. Reported as a film
+    // that "sometimes ends in black, sometimes on the outro" — intermittent
+    // because it depends where playback stops, which is what an ambiguous file
+    // buys. Nothing is missing: the last encoded frame is the outro, full and
+    // bright, and the luminance never ramps.
+    //
+    // **The ffmpeg equivalent this mux replaces has always carried
+    // `-shortest`** — it is written out in `app/lib/poc/score.dart`'s own
+    // comment — so this is the documented contract arriving in the
+    // implementation rather than a new policy. The audience is YouTube and
+    // Instagram and a published film cannot be patched, so an ambiguity each
+    // platform resolves its own way is worth a line to remove.
+    audioReader.timeRange =
+        CMTimeRangeMake(kCMTimeZero, videoTrack.timeRange.duration);
+
     AVAssetWriter *writer = [AVAssetWriter assetWriterWithURL:[NSURL fileURLWithPath:outputPath]
                                                      fileType:AVFileTypeMPEG4
                                                         error:&error];

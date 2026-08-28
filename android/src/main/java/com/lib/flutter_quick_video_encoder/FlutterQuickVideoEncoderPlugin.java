@@ -760,6 +760,28 @@ public class FlutterQuickVideoEncoderPlugin implements
             }
             videoExtractor.selectTrack(videoTrack);
 
+            // **How long the audio is allowed to be, which is `-shortest`.**
+            // The score is generated to the film's length and lands a little
+            // past it — 27 ms on a measured 113 s export, under one frame at
+            // 30 fps. Fed whole, that tail becomes the *container's* duration,
+            // so the timeline runs past the last video sample and there is a
+            // sliver with no picture in it. Players disagree about what to show
+            // there; the film "sometimes ends in black, sometimes on the outro",
+            // intermittently, depending where playback stops.
+            //
+            // The ffmpeg equivalent this mux replaces has always carried
+            // `-shortest`, written out in `app/lib/poc/score.dart`'s comment, so
+            // this is the documented contract arriving in the implementation.
+            //
+            // **Negative when the track declares no duration**, which is a real
+            // answer rather than zero: an extractor that cannot say how long the
+            // video is must not be read as "the video is empty", which would
+            // drop the score entirely. The clamp below is skipped in that case
+            // and the old behavior stands.
+            long videoDurationUs = videoFormat.containsKey(MediaFormat.KEY_DURATION)
+                    ? videoFormat.getLong(MediaFormat.KEY_DURATION)
+                    : -1;
+
             WavReader wav = new WavReader(audioPath);
 
             muxer = new MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
@@ -792,7 +814,15 @@ public class FlutterQuickVideoEncoderPlugin implements
                         // Taken before the read, so it timestamps the start of
                         // this buffer rather than the end of it.
                         long pts = wav.presentationTimeUs();
-                        int read = wav.read(buffer);
+                        // **Stop at the video's end, not the file's.** Whole
+                        // buffers rather than a split one: the overhang is
+                        // under a frame, so the audio ends at most one buffer
+                        // early — inaudible — where a partial buffer would mean
+                        // hand-trimming PCM and getting the sample alignment
+                        // right for no gain anybody can hear.
+                        int read = (videoDurationUs > 0 && pts >= videoDurationUs)
+                                ? 0
+                                : wav.read(buffer);
                         if (read <= 0) {
                             encoder.queueInputBuffer(index, 0, 0, pts,
                                     MediaCodec.BUFFER_FLAG_END_OF_STREAM);
