@@ -271,6 +271,16 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
+          # **The action gives an AVD two cores by default, and the runner has
+          # four.** Every decode-driven test failed on the first run with
+          # `decoder produced nothing for 20s (decoder=c2.goldfish.h264.decoder)`
+          # — the emulator's software H.264 decoder stalling rather than being
+          # slow, since one layout line *was* logged before it went quiet. This
+          # is the one knob that separates starvation from a wedged decoder; if
+          # the failure survives it, the answer is the second and tier 2 does not
+          # belong on a hosted runner at all.
+          cores: 4
+          ram-size: 4096
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           # **Two classes are excluded, and both because they ask the machine a
           # question rather than the code one.**
