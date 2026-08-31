@@ -2,6 +2,7 @@ package com.lib.flutter_quick_video_encoder;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -70,18 +71,47 @@ public class ClipPreviewCacheTest {
         }
     }
 
+    /**
+     * One answer, and <b>which</b> answer it was.
+     *
+     * <p>{@link ClipPreviewCache.Delivery} has two methods for a reason — a
+     * retired decode says nothing whatever about the clip — so collapsing them
+     * into one lambda would read a screen that let go as a file with no
+     * picture. Nothing in this class bumps the generation, so `onRetired`
+     * firing at all is a fault in the test's own setup and has to say so rather
+     * than arrive looking like a null frame.
+     */
+    private static final class Answer implements ClipPreviewCache.Delivery {
+        private final CountDownLatch done = new CountDownLatch(1);
+        private final AtomicReference<ClipPreview.Image> held = new AtomicReference<>();
+        private volatile boolean retired;
+
+        @Override
+        public void onImage(ClipPreview.Image image) {
+            held.set(image);
+            done.countDown();
+        }
+
+        @Override
+        public void onRetired() {
+            retired = true;
+            done.countDown();
+        }
+
+        ClipPreview.Image await(String what) throws InterruptedException {
+            assertTrue(what + " never came back", done.await(30, TimeUnit.SECONDS));
+            assertFalse(what + " came back retired, and nothing here lets go of a screen",
+                    retired);
+            return held.get();
+        }
+    }
+
     /** Blocks on one preview, the way a `Future` off the method channel would. */
     private static ClipPreview.Image preview(ClipPreviewCache cache, long timeUs)
             throws InterruptedException {
-        final AtomicReference<ClipPreview.Image> held = new AtomicReference<>();
-        final CountDownLatch done = new CountDownLatch(1);
-        cache.frameAt(clip.getAbsolutePath(), timeUs, MAX_EDGE, image -> {
-            held.set(image);
-            done.countDown();
-        });
-        assertTrue("the preview never came back for " + timeUs + "us",
-                done.await(30, TimeUnit.SECONDS));
-        return held.get();
+        final Answer answer = new Answer();
+        cache.frameAt(clip.getAbsolutePath(), timeUs, MAX_EDGE, answer);
+        return answer.await("the preview for " + timeUs + "us");
     }
 
     /** The same question asked of a reader that has never seen another instant. */
@@ -220,15 +250,11 @@ public class ClipPreviewCacheTest {
         }
 
         final ClipPreviewCache cache = new ClipPreviewCache();
-        final AtomicReference<ClipPreview.Image> held = new AtomicReference<>();
-        final CountDownLatch done = new CountDownLatch(1);
+        final Answer answer = new Answer();
         try {
-            cache.frameAt(notAVideo.getAbsolutePath(), 0L, MAX_EDGE, image -> {
-                held.set(image);
-                done.countDown();
-            });
-            assertTrue("nothing came back at all", done.await(30, TimeUnit.SECONDS));
-            assertNull("a file with no video track must answer null", held.get());
+            cache.frameAt(notAVideo.getAbsolutePath(), 0L, MAX_EDGE, answer);
+            assertNull("a file with no video track must answer null",
+                    answer.await("the unreadable file"));
         } finally {
             cache.release();
             notAVideo.delete();
@@ -281,22 +307,18 @@ public class ClipPreviewCacheTest {
                 MediaFormat.COLOR_RANGE_LIMITED);
 
         final ClipPreviewCache cache = new ClipPreviewCache();
-        final AtomicReference<ClipPreview.Image> held = new AtomicReference<>();
         try {
             for (int round = 0; round < 3; round++) {
                 final ClipPreview.Image first = preview(cache, 1_050_000L);
                 assertEquals("round " + round + " kept the first clip's shape",
                         Math.round(188.0 * MAX_EDGE / 300.0), first.height);
 
-                final CountDownLatch done = new CountDownLatch(1);
-                cache.frameAt(second.getAbsolutePath(), 1_050_000L, MAX_EDGE, image -> {
-                    held.set(image);
-                    done.countDown();
-                });
-                assertTrue(done.await(30, TimeUnit.SECONDS));
-                assertNotNull("the second clip did not decode", held.get());
+                final Answer answer = new Answer();
+                cache.frameAt(second.getAbsolutePath(), 1_050_000L, MAX_EDGE, answer);
+                final ClipPreview.Image other = answer.await("round " + round);
+                assertNotNull("the second clip did not decode", other);
                 assertEquals("round " + round + " kept the second clip's shape",
-                        Math.round(180.0 * MAX_EDGE / 320.0), held.get().height);
+                        Math.round(180.0 * MAX_EDGE / 320.0), other.height);
             }
         } finally {
             cache.release();
