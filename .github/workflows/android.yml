@@ -30,15 +30,19 @@
 #
 # ## The three tiers, and which two are here
 #
-# | tier | catches | needs |
-# |---|---|---|
-# | 1 `assembleDebugAndroidTest` | the compile break that actually happened | nothing |
-# | 2 emulator run | logic regressions, on one plane layout | a runner with KVM |
-# | 3 hardware run | the layout branches that matter | a real phone |
+# | tier | catches | needs | here? |
+# |---|---|---|---|
+# | 1 `assembleDebugAndroidTest` | the compile break that actually happened | nothing | **yes** |
+# | 2 emulator run | nothing, as it turns out | a runner with KVM | no — built, measured, deleted |
+# | 3 hardware run | the layout branches that matter | a real phone | no — manual on purpose |
 #
-# **Tier 3 stays manual, and tier 2 is worth much less than it looks.** The
-# warning is on the emulator job itself rather than only here, because that is
-# where somebody reads a green check.
+# **Only tier 1 survived, and tier 2's absence is documented rather than
+# implied** — the block above the deleted job says what four runs measured, so
+# the next person reaches for an emulator on evidence rather than on hope.
+#
+# What this workflow therefore claims is narrow and exact: the instrumented tests
+# still **compile**, and the host-side tests still **pass**. Whether the
+# instrumented tests pass is a question only a phone answers.
 
 name: Android
 
@@ -213,112 +217,50 @@ jobs:
           echo "test APK: $apk ($(du -h "$apk" | cut -f1))"
           echo "Instrumented test APK built: \`$(basename "$apk")\`." >> "$GITHUB_STEP_SUMMARY"
 
-  # ## Tier 2 — the instrumented suite runs, on an emulator, which is not a phone
+  # ## Tier 2 was built, measured on four runs, and deleted. Do not rebuild it.
   #
-  # **Read `app/android/FIRST-DEVICE-RUN.md` before believing anything this job
-  # says.** Measured, on the same 300x188 clip deliberately sized so as not to be
-  # macroblock-aligned:
+  # There was an `emulator` job here — `reactivecircus/android-emulator-runner`,
+  # API 34 `google_apis` x86_64, running `connectedDebugAndroidTest`. It worked
+  # in the sense that it ran. It is gone because of what it ran.
   #
-  #     emulator   y(row=300,px=1) u(row=150,px=1) v(row=150,px=1)
-  #     S24 Ultra  y(row=384,px=1) u(row=384,px=2) v(row=384,px=2)
+  # **Every decode-driven test failed, on one line:**
   #
-  # An emulator hands back the friendliest layout in the
-  # `COLOR_FormatYUV420Flexible` family — fully planar, chroma pixel stride 1,
-  # row stride exactly the width. **The padded and semiplanar branches, which a
-  # real phone takes on every frame, ran zero times.** That file's own verdict:
-  # *"eleven green tests on an emulator said nothing at all about the code paths
-  # that a real phone runs every frame."*
+  #     java.io.IOException: decoder produced nothing for 20s on
+  #     …/synthetic-rec709.mp4 (decoder=c2.goldfish.h264.decoder)
   #
-  # So the job is named for the machine it runs on, and the step below asserts
-  # the layout it actually got rather than merely printing it — a runner image
-  # that started padding rows would announce itself instead of quietly widening
-  # coverage and letting this file's caveat go stale.
-  emulator:
-    name: instrumented tests on an emulator (NOT a phone)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-      - uses: subosito/flutter-action@v2
-        with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: stable
-          cache: true
-
-      - name: Generate the example host project
-        run: |
-          flutter pub get
-          cd example
-          flutter create --platforms=android .
-          flutter pub get
-
-      # The hosted Ubuntu image has KVM but does not expose it to the runner
-      # user, and without it the emulator falls back to full software emulation
-      # and takes long enough to be useless.
-      - name: Let the runner reach KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-
-      - uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 34
-          target: google_apis
-          arch: x86_64
-          profile: pixel_6
-          # **The action gives an AVD two cores by default, and the runner has
-          # four.** Every decode-driven test failed on the first run with
-          # `decoder produced nothing for 20s (decoder=c2.goldfish.h264.decoder)`
-          # — the emulator's software H.264 decoder stalling rather than being
-          # slow, since one layout line *was* logged before it went quiet. This
-          # is the one knob that separates starvation from a wedged decoder; if
-          # the failure survives it, the answer is the second and tier 2 does not
-          # belong on a hosted runner at all.
-          cores: 4
-          ram-size: 4096
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          # **Two classes are excluded, and both because they ask the machine a
-          # question rather than the code one.**
-          #
-          # `ClipCompositeCostTest` asserts a wall-clock ceiling — one composited
-          # 4K frame under 250 ms — on a shared runner driving a software codec.
-          # Its own doc says an absolute figure on an unfamiliar platform mostly
-          # measures the platform, and the parent repository's rule is that
-          # nothing in CI gates on performance.
-          #
-          # `ClipDeviceCapabilityTest` asserts that *this device* has a 4K HEVC
-          # Main10 decoder and enough concurrent instances. That is a true and
-          # useful question to ask of a rider's phone and a meaningless one to
-          # ask of a runner; a red X here would say nothing about the code.
-          #
-          # A deny-list rather than an allow-list, so a test added tomorrow runs
-          # by existing. `ClipMemoryCostTest` and `ClipTenBitTest` need fixtures
-          # pushed to `/data/local/tmp` and skip themselves with `Assume`, which
-          # is honest without help.
-          #
-          # **`script` must be one line, and that is not a style choice.** This
-          # action runs the input *one line at a time*, each through its own
-          # `/usr/bin/sh -c`, so a subshell spanning two lines is a syntax error,
-          # an `if` never reaches its `fi`, and a variable set on one line is gone
-          # by the next. The first run of this workflow died on
-          # `Syntax error: end of file unexpected (expecting ")")` after the
-          # emulator had booted — which reads like a broken test and is not one.
-          # The body lives in a file, which also gets exported by the subtree
-          # push and can be run by hand.
-          script: bash .github/scripts/emulator-instrumented-tests.sh
-
-      - name: Keep the reports and the log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: emulator-reports
-          path: |
-            example/build/flutter_quick_video_encoder/reports/
-            example/build/flutter_quick_video_encoder/outputs/androidTest-results/
-            ${{ runner.temp }}/logcat.txt
-          if-no-files-found: ignore
+  # Not slowness — a stall. A `CLIP layout` line was logged before the decoder
+  # went quiet, so the first decode produced output and later ones did not, and
+  # no software decoder needs twenty seconds for one 300x188 frame. The action
+  # gives the AVD `hw.cpu.ncore=2` where the runner has four, so one run raised
+  # it to `cores: 4` / `ram-size: 4096` to tell starvation from a wedged decoder.
+  # Confirmed applied, and the failures went from 10 to **16**. It is the decoder.
+  #
+  # **Of 35 tests: 17 passed, 16 failed, 2 skipped** — and the 16 are exactly
+  # `ClipReaderTest` (10) and `ClipPreviewCacheTest` (6), the two classes that
+  # scrub, seek and reopen. Straightforward decoding survives; the reopen-and-seek
+  # pattern wedges the goldfish decoder. So a hosted emulator gives not *narrow*
+  # coverage of the clip path but **none of the part that matters**, while the
+  # seventeen that pass are the parts nobody doubted.
+  #
+  # **Deny-listing those two classes was the tempting fix and is the wrong one.**
+  # They are the logic tests. A tier 2 without them is a green check standing over
+  # the exact code the suite exists to protect — which is worse than no job,
+  # because a green check is read as an answer.
+  #
+  # The parent repository's `.github/workflows/ci.yml` reached this in prose
+  # before any of it ran: *"a hosted Android runner is an emulator and an emulator
+  # runs software codecs… A job that exercises a different decoder and reports on
+  # the same name is worse than no job."* It is measured now rather than argued.
+  #
+  # **The ceiling of the technique, which is the finding worth keeping: CI can
+  # restore that a device test still compiles. It can never restore what that
+  # test asserts.** Running these needs a phone — `app/android/FIRST-DEVICE-RUN.md`
+  # is that document, and tier 3 is manual on purpose.
+  #
+  # One result survived the attempt and is worth not re-deriving: GitHub's x86_64
+  # API 34 image logs exactly the layout FIRST-DEVICE-RUN measured on an arm64
+  # Pixel 9 — `y(row=300,px=1) u(row=150,px=1) v(row=150,px=1)`. Two unrelated
+  # emulators agree on the friendliest layout, and neither phone does.
+  #
+  # If a self-hosted runner with a phone on it ever appears, tier 3 belongs there
+  # and this comment is the specification for it. An emulator is not that runner.
