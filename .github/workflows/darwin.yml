@@ -1,0 +1,128 @@
+# The Apple checks for this plugin, which run here because nothing else runs them.
+#
+# Same trick as `android.yml`: this file is inert in the private repository that
+# owns the plugin — GitHub reads workflows only from a repository's root, and
+# there this lives under `third_party/flutter_quick_video_encoder/` — and active
+# in the public fork, where `git subtree push` makes that prefix the root and
+# Actions minutes are free.
+#
+# ## Why an Apple job exists at all, given there are no Apple tests
+#
+# The Android story was a *test* source set that stopped compiling and nobody
+# noticed for ten days. **The Apple half cannot have that bug, because it has no
+# test source set**: `Package.swift` declares one target and no `.testTarget`,
+# the podspec declares no test spec, and there is no `Tests/` directory. The only
+# XCTest bundles in the parent repository are `app/ios/RunnerTests` and its macOS
+# twin, both the untouched Flutter template with one empty `testExample()`.
+#
+# That absence is deliberate, and `app/integration_test/clip_color_parity_test.dart`
+# argues it well: `clipFrameAt` is the only path by which a converted pixel
+# reaches Dart, so one integration test run on each platform compares both native
+# conversions from a single source, which is cheaper than a second test target.
+#
+# **But that test runs in no job today.** It lives in `app/integration_test`,
+# which only the parent's `integration-macos` job runs, and that job is switched
+# off behind `vars.APPLE_CI` because GitHub refuses hosted jobs on that account
+# for billing. So the 2,600-odd lines of Objective-C here — including
+# `FQVEClipColor.m`, one arithmetic written twice with the Java `ClipColor` —
+# have **no automatic check of any kind** right now.
+#
+# This is the cheapest true thing that can be said in that situation: the Apple
+# sources still compile, for both platforms that ship them. It is the exact
+# mirror of `android.yml`'s tier 1, and it earns its place the same way — *these
+# sources still build* and *these sources still work* are different guarantees,
+# and only the first is free.
+#
+# **What it does not restore**: the Java/Objective-C parity check. That needs
+# `app/`, which is not in this repository, so it can only come back by turning
+# the parent's switch on — `gh variable set APPLE_CI --body on`, no code change.
+# PLAN §7 records that those two conversions had already drifted once, on
+# ordinary Rec.709 SDR, so that remains a real hole rather than a tidy-up.
+
+name: Darwin
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: 3.47.0
+
+jobs:
+  compile:
+    name: darwin sources compile (${{ matrix.platform }})
+    runs-on: macos-latest
+    strategy:
+      # Each platform reports for itself. `sharedDarwinSource: true` means both
+      # compile the same `.m` files, but against different SDKs and a different
+      # architecture, and one hiding the other is how a UIKit-only mistake ships.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            build: flutter build macos --debug
+            # The one linked object Flutter emits for this plugin. Deliberately
+            # not the path under `Intermediates.noindex`, which encodes Xcode's
+            # internal layout and would rot with a toolchain bump.
+            object: build/macos/Build/Products/Debug/flutter_quick_video_encoder.o
+          - platform: ios
+            # `--no-codesign`, because a hosted runner has no signing identity
+            # and this asks whether the code compiles rather than whether it can
+            # be shipped.
+            build: flutter build ios --no-codesign --debug
+            object: build/ios/Debug-iphoneos/flutter_quick_video_encoder.o
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # `example/`'s platform folders are gitignored, exactly as on the Android
+      # side, so each run regenerates against the current Flutter template rather
+      # than against a stale checked-in one.
+      - name: Generate the example host project
+        run: |
+          flutter pub get
+          cd example
+          flutter create --platforms=${{ matrix.platform }} .
+          flutter pub get
+
+      - name: Build it
+        run: cd example && ${{ matrix.build }}
+
+      # **A green build is not evidence that this plugin compiled**, and finding
+      # that out is what earned this step. On macOS the built app carries no
+      # plugin symbols anywhere an obvious probe would look: with Swift Package
+      # Manager there is no `flutter_quick_video_encoder.framework` under
+      # `Contents/Frameworks`, and `nm` and `strings` over `Contents/MacOS/example`
+      # both return **zero** matches for `FQVE`. Two plausible checks, both of
+      # which would have asserted the exact opposite of the truth.
+      #
+      # The linked object is the artifact that answers it, and it is checked for
+      # a **named defined symbol** rather than for existing — an empty or stubbed
+      # object would satisfy mere existence. `T` is nm's marker for a symbol
+      # defined here rather than imported from somewhere else.
+      - name: The Objective-C actually compiled
+        working-directory: example
+        run: |
+          object='${{ matrix.object }}'
+          if [ ! -s "$object" ]; then
+            echo "::error::$object is missing or empty — the build did not compile this plugin"
+            exit 1
+          fi
+          symbols=$(nm "$object" 2>/dev/null | grep -c 'FQVE' || true)
+          echo "$object — $(stat -f%z "$object") bytes, $symbols FQVE symbols"
+          if ! nm "$object" 2>/dev/null | grep -q 'T _FQVEClipColorToRgb'; then
+            echo "::error::FQVEClipColorToRgb is not *defined* in $object"
+            echo "::error::The plugin linked without its color conversion, or the symbol was renamed."
+            exit 1
+          fi
+          echo "\`${{ matrix.platform }}\`: $symbols FQVE symbols, \`FQVEClipColorToRgb\` defined." \
+            >> "$GITHUB_STEP_SUMMARY"
