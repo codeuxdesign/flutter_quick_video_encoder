@@ -1,0 +1,374 @@
+# The Android checks for this plugin, which run in the public fork.
+#
+# **This file is inert where it is written and active where it is pushed.**
+# GitHub reads workflows only from a repository's root, and this plugin is a
+# subtree of a larger, *private* repository — so here the path is
+# `third_party/flutter_quick_video_encoder/.github/workflows/`, which GitHub
+# ignores, and after `git subtree push --prefix=third_party/flutter_quick_video_encoder`
+# the same file sits at the root of `codeuxdesign/flutter_quick_video_encoder`,
+# which is public and therefore has free Actions minutes.
+#
+# That is the whole reason it is not in the parent repository's own `ci.yml`:
+# the parent is private, its hosted jobs are refused for billing, and paying to
+# fix that is not the plan. The plugin is still *edited* only in the parent —
+# never commit in a clone of the fork, or a synthesized subtree history and a
+# handwritten one have to be merged.
+#
+# ## What this exists to prevent
+#
+# `src/androidTest` had not compiled since 21 August 2026 and nobody knew.
+# `ClipPreviewCache.Delivery` gained a second method, `onRetired()`, and
+# `ClipPreviewCacheTest` passes it a lambda — which Java allows only for an
+# interface with a single abstract method. A hard compile error, taking all
+# fifteen instrumented tests with it, and it surfaced ten days later only
+# because somebody wanted an answer from one of those tests.
+#
+# **Nobody was careless.** The parent's CI excludes the device suites
+# deliberately, because they need hardware. But excluding them from *running*
+# also excluded them from *compiling*, and those are different guarantees. This
+# file exists to hold the second one on every push, with no device involved.
+#
+# ## The three tiers, and which two are here
+#
+# | tier | catches | needs |
+# |---|---|---|
+# | 1 `assembleDebugAndroidTest` | the compile break that actually happened | nothing |
+# | 2 emulator run | logic regressions, on one plane layout | a runner with KVM |
+# | 3 hardware run | the layout branches that matter | a real phone |
+#
+# **Tier 3 stays manual, and tier 2 is worth much less than it looks.** The
+# warning is on the emulator job itself rather than only here, because that is
+# where somebody reads a green check.
+
+name: Android
+
+# **`push` is the trigger that actually fires here.** The plugin's code lives on
+# `android-clip-compositor`, and a subtree push to that branch runs the workflow
+# on that branch's own tree — which is this file.
+#
+# `workflow_dispatch` is listed and is currently **inert**: GitHub offers manual
+# runs only for workflows present on the repository's *default* branch, and the
+# fork's default is still `master` — the stale upstream, two weeks behind and
+# without any of this code. Pointing the default branch at
+# `android-clip-compositor` turns the "Run workflow" button on, and is the right
+# move whenever somebody gets to it.
+#
+# No `pull_request`: nothing is ever edited in the fork, so there are no pull
+# requests to gate. Add it the day that stops being true.
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned, and matching the toolchain the parent repository is written on
+  # rather than the newest release — a runner ahead of every developer fails on
+  # code nobody can reproduce against. `pubspec.yaml` here says
+  # `flutter: ">=3.47.0"`; this line moves when that one does.
+  FLUTTER_VERSION: 3.47.0
+
+  # The library's own Gradle build carries no Flutter embedding dependency — the
+  # Flutter Gradle plugin injects it into every plugin subproject of a host app.
+  # So there is no way to compile this library alone, and every job below builds
+  # it through `example/`.
+  #
+  # `example/` is committed as a pubspec and a `main.dart` and nothing else; its
+  # `android/` host project is gitignored, so each job regenerates it with
+  # `flutter create`. That also means the host project is always the current
+  # template rather than a stale checked-in one.
+  PLUGIN: ':flutter_quick_video_encoder'
+
+  # Flutter redirects a plugin subproject's build directory under the host app's
+  # own, so nothing lands in `android/build` where you would look for it.
+  BUILD: example/build/flutter_quick_video_encoder
+
+jobs:
+  # The 51 host-side JUnit tests: the source-over blend, the quarter-turn
+  # branches, chroma indexing, the Rec.601/709/2020 matrices, the HLG and PQ
+  # conversions, and plane layouts laid out by hand. These are the only part of
+  # the Android clip path a machine with no Android on it can run at all, and
+  # they were ungated too.
+  unit:
+    name: host unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Generate the example host project
+        run: |
+          flutter pub get
+          cd example
+          flutter create --platforms=android .
+          flutter pub get
+
+      - name: Run them
+        run: cd example/android && ./gradlew "$PLUGIN:testDebugUnitTest" --console=plain
+
+      # **A Gradle test task that runs zero tests is `BUILD SUCCESSFUL`.** If the
+      # source set ever moves, or a filter goes wrong, the green check above says
+      # exactly what it says today and means nothing — absence and success drawn
+      # identically. So count what ran, fail on nothing, and print the number
+      # rather than the intent.
+      #
+      # No floor is asserted, deliberately. A hard-coded expected count rots the
+      # way `app/android/FIRST-DEVICE-RUN.md` did, which still claims 33 of these
+      # exist; the count in the summary is what a reader should compare against.
+      - name: Some tests actually ran
+        if: always()
+        run: |
+          results="$BUILD/test-results/testDebugUnitTest"
+          if [ ! -d "$results" ]; then
+            echo "::error::no test results at $results — the task ran no tests"
+            exit 1
+          fi
+          total=$(grep -ho 'tests="[0-9]*"' "$results"/TEST-*.xml \
+                  | tr -dc '0-9\n' | awk '{ n += $1 } END { print n + 0 }')
+          echo "host unit tests run: $total"
+          if [ "$total" -eq 0 ]; then
+            echo "::error::the unit test task passed having run no tests at all"
+            exit 1
+          fi
+          echo "\`$total\` host-side JUnit tests ran." >> "$GITHUB_STEP_SUMMARY"
+
+  # ## Tier 1 — the instrumented suite compiles
+  #
+  # This is the job that would have gone red on 21 August. It compiles
+  # `src/androidTest` and packages the test APK without running anything, so it
+  # needs no device, no KVM and about two minutes.
+  #
+  # It is a separate job from the emulator below even though the emulator run
+  # compiles the same sources, and that is the point: an emulator job that fails
+  # to boot, times out, or cannot pull its system image tells you nothing about
+  # whether the code compiles. Two jobs, two answers, neither able to be
+  # mistaken for the other.
+  compile-instrumented:
+    name: instrumented tests compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Generate the example host project
+        run: |
+          flutter pub get
+          cd example
+          flutter create --platforms=android .
+          flutter pub get
+
+      - name: Compile and package them
+        run: cd example/android && ./gradlew "$PLUGIN:assembleDebugAndroidTest" --console=plain
+
+      # **`compileDebugAndroidTestJavaWithJavac` reports `NO-SOURCE` and succeeds
+      # when it finds nothing to compile**, so `assembleDebugAndroidTest` going
+      # green is not by itself evidence that any test was compiled — it is the
+      # same defect this whole file exists to catch, one level up.
+      #
+      # The check is self-maintaining rather than a number: every `.java` under
+      # `src/androidTest` must have produced a top-level `.class`. A test added
+      # tomorrow is covered by existing, and a source set that stopped being
+      # compiled shows up as a named list rather than as silence.
+      - name: Every instrumented source produced a class
+        run: |
+          classes="$BUILD/intermediates/javac/debugAndroidTest"
+          find android/src/androidTest -name '*.java' \
+            | sed 's|.*/||;s|\.java$||' | sort -u > /tmp/sources.txt
+          find "$classes" -name '*.class' ! -name '*$*' 2>/dev/null \
+            | sed 's|.*/||;s|\.class$||' | sort -u > /tmp/compiled.txt
+          echo "instrumented sources: $(wc -l < /tmp/sources.txt), compiled: $(wc -l < /tmp/compiled.txt)"
+          missing=$(comm -23 /tmp/sources.txt /tmp/compiled.txt)
+          if [ -n "$missing" ]; then
+            echo "::error::these instrumented sources compiled to nothing: $(echo "$missing" | tr '\n' ' ')"
+            exit 1
+          fi
+
+      # And the artifact itself, because a class file is an intermediate and the
+      # APK is the thing a device would be handed.
+      - name: The test APK exists
+        run: |
+          apk=$(find "$BUILD/outputs/apk/androidTest" -name '*.apk' | head -1)
+          if [ -z "$apk" ]; then
+            echo "::error::assembleDebugAndroidTest produced no APK"
+            exit 1
+          fi
+          echo "test APK: $apk ($(du -h "$apk" | cut -f1))"
+          echo "Instrumented test APK built: \`$(basename "$apk")\`." >> "$GITHUB_STEP_SUMMARY"
+
+  # ## Tier 2 — the instrumented suite runs, on an emulator, which is not a phone
+  #
+  # **Read `app/android/FIRST-DEVICE-RUN.md` before believing anything this job
+  # says.** Measured, on the same 300x188 clip deliberately sized so as not to be
+  # macroblock-aligned:
+  #
+  #     emulator   y(row=300,px=1) u(row=150,px=1) v(row=150,px=1)
+  #     S24 Ultra  y(row=384,px=1) u(row=384,px=2) v(row=384,px=2)
+  #
+  # An emulator hands back the friendliest layout in the
+  # `COLOR_FormatYUV420Flexible` family — fully planar, chroma pixel stride 1,
+  # row stride exactly the width. **The padded and semiplanar branches, which a
+  # real phone takes on every frame, ran zero times.** That file's own verdict:
+  # *"eleven green tests on an emulator said nothing at all about the code paths
+  # that a real phone runs every frame."*
+  #
+  # So the job is named for the machine it runs on, and the step below asserts
+  # the layout it actually got rather than merely printing it — a runner image
+  # that started padding rows would announce itself instead of quietly widening
+  # coverage and letting this file's caveat go stale.
+  emulator:
+    name: instrumented tests on an emulator (NOT a phone)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Generate the example host project
+        run: |
+          flutter pub get
+          cd example
+          flutter create --platforms=android .
+          flutter pub get
+
+      # The hosted Ubuntu image has KVM but does not expose it to the runner
+      # user, and without it the emulator falls back to full software emulation
+      # and takes long enough to be useless.
+      - name: Let the runner reach KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          # **Two classes are excluded, and both because they ask the machine a
+          # question rather than the code one.**
+          #
+          # `ClipCompositeCostTest` asserts a wall-clock ceiling — one composited
+          # 4K frame under 250 ms — on a shared runner driving a software codec.
+          # Its own doc says an absolute figure on an unfamiliar platform mostly
+          # measures the platform, and the parent repository's rule is that
+          # nothing in CI gates on performance.
+          #
+          # `ClipDeviceCapabilityTest` asserts that *this device* has a 4K HEVC
+          # Main10 decoder and enough concurrent instances. That is a true and
+          # useful question to ask of a rider's phone and a meaningless one to
+          # ask of a runner; a red X here would say nothing about the code.
+          #
+          # A deny-list rather than an allow-list, so a test added tomorrow runs
+          # by existing. `ClipMemoryCostTest` and `ClipTenBitTest` need fixtures
+          # pushed to `/data/local/tmp` and skip themselves with `Assume`, which
+          # is honest without help.
+          script: |
+            adb logcat -G 16M
+            adb logcat -c
+
+            status=0
+            (cd example/android && ./gradlew "$PLUGIN:connectedDebugAndroidTest" --console=plain \
+              -Pandroid.testInstrumentationRunnerArguments.notClass=com.lib.flutter_quick_video_encoder.ClipCompositeCostTest,com.lib.flutter_quick_video_encoder.ClipDeviceCapabilityTest) \
+              || status=1
+
+            adb logcat -d > "$RUNNER_TEMP/logcat.txt"
+            layouts=$(grep -o 'CLIP layout .*' "$RUNNER_TEMP/logcat.txt" | sort -u || true)
+
+            {
+              echo "### Instrumented run — emulator, API 34, google_apis x86_64"
+              echo
+              echo 'Plane layouts this run actually exercised:'
+              echo
+              echo '```'
+              echo "${layouts:-(none logged)}"
+              echo '```'
+              echo
+              echo 'An emulator hands back the friendliest layout in the'
+              echo '`COLOR_FormatYUV420Flexible` family. The padded and semiplanar'
+              echo 'branches a real phone takes on every frame did not run here.'
+              echo '**Green is not "the device suite passes."** Tier 3 is still manual —'
+              echo 'see `app/android/FIRST-DEVICE-RUN.md`.'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "$layouts"
+
+            # Only asserted when the run itself succeeded. If the tests failed,
+            # the reason is above and a second failure here for a missing log
+            # line would send the next reader to the wrong place.
+            if [ "$status" -ne 0 ]; then
+              echo "layout not checked — the instrumented run failed above"
+              exit "$status"
+            fi
+
+            # No layout line at all means no clip was decoded, which means the
+            # tests did not do the thing they are named for however green they
+            # look.
+            if [ -z "$layouts" ]; then
+              echo "::error::the run logged no 'CLIP layout' line — nothing decoded a clip"
+              exit 1
+            fi
+
+            # The claim: fully planar (chroma pixel stride 1) and unpadded (luma
+            # row stride equal to the used width). That is what was measured on
+            # an emulator and it is *narrower* than what a phone does. Failing
+            # when it changes is the point — a runner image that started padding
+            # rows has widened this job's coverage, and the comments above and in
+            # FIRST-DEVICE-RUN.md are then wrong and want rewriting.
+            echo "$layouts" | awk '
+              {
+                used = $0; sub(/.*used=/, "", used); sub(/x.*/, "", used)
+                yrow = $0; sub(/.*y\(row=/, "", yrow); sub(/,.*/, "", yrow)
+                if ($0 !~ /u\(row=[0-9]+,px=1\) v\(row=[0-9]+,px=1\)/) {
+                  print "chroma is not planar in: " $0; bad = 1
+                }
+                if (yrow != used) {
+                  print "luma rows are padded (" yrow " for width " used ") in: " $0; bad = 1
+                }
+              }
+              END {
+                if (bad) {
+                  print "::error::the emulator no longer hands back the planar unpadded layout."
+                  print "::error::That is wider coverage than this job claims — update the note"
+                  print "::error::here and in app/android/FIRST-DEVICE-RUN.md, then re-pin it."
+                  exit 1
+                }
+              }'
+
+      - name: Keep the reports and the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-reports
+          path: |
+            example/build/flutter_quick_video_encoder/reports/
+            example/build/flutter_quick_video_encoder/outputs/androidTest-results/
+            ${{ runner.temp }}/logcat.txt
+          if-no-files-found: ignore
